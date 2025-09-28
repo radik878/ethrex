@@ -45,6 +45,7 @@
   - [Withdraw assets](./l2/interacting/withdraw.md)
   - [Connect a wallet](./l2/interacting/wallet.md)
   - [Deploy a contract](./l2/interacting/deploy_contracts.md)
+  - [Uniswap V3 deployment](./l2/interacting/uniswap_v3.md)
 - [Fundamentals](./l2/fundamentals/README.md)
   - [State diffs](./l2/fundamentals/state_diffs.md)
   - [Deposits](./l2/fundamentals/deposits.md)
