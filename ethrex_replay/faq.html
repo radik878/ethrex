@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Configuration - Ethrex</title>
+        <title>FAQ - Ethrex</title>
 
 
         <!-- Custom HTML head -->
@@ -12,33 +12,33 @@
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
-        <link rel="icon" href="../../favicon.svg">
-        <link rel="shortcut icon" href="../../favicon.png">
-        <link rel="stylesheet" href="../../css/variables.css">
-        <link rel="stylesheet" href="../../css/general.css">
-        <link rel="stylesheet" href="../../css/chrome.css">
-        <link rel="stylesheet" href="../../css/print.css" media="print">
+        <link rel="icon" href="../favicon.svg">
+        <link rel="shortcut icon" href="../favicon.png">
+        <link rel="stylesheet" href="../css/variables.css">
+        <link rel="stylesheet" href="../css/general.css">
+        <link rel="stylesheet" href="../css/chrome.css">
+        <link rel="stylesheet" href="../css/print.css" media="print">
 
         <!-- Fonts -->
-        <link rel="stylesheet" href="../../FontAwesome/css/font-awesome.css">
-        <link rel="stylesheet" href="../../fonts/fonts.css">
+        <link rel="stylesheet" href="../FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="../fonts/fonts.css">
 
         <!-- Highlight.js Stylesheets -->
-        <link rel="stylesheet" id="highlight-css" href="../../highlight.css">
-        <link rel="stylesheet" id="tomorrow-night-css" href="../../tomorrow-night.css">
-        <link rel="stylesheet" id="ayu-highlight-css" href="../../ayu-highlight.css">
+        <link rel="stylesheet" id="highlight-css" href="../highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="../tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="../ayu-highlight.css">
 
         <!-- Custom theme stylesheets -->
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
-            const path_to_root = "../../";
+            const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../../toc.js"></script>
+        <script src="../toc.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -102,7 +102,7 @@
             <!-- populated by js -->
             <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
             <noscript>
-                <iframe class="sidebar-iframe-outer" src="../../toc.html"></iframe>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
             </noscript>
             <div id="sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -137,7 +137,7 @@
                     <h1 class="menu-title">Ethrex</h1>
 
                     <div class="right-buttons">
-                        <a href="../../print.html" title="Print this book" aria-label="Print this book">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
                             <i id="print-button" class="fa fa-print"></i>
                         </a>
                         <a href="https://github.com/lambdaclass/ethrex" title="Git repository" aria-label="Git repository">
@@ -237,56 +237,31 @@
 }
 
 </style>
-<h1 id="configuration"><a class="header" href="#configuration">Configuration</a></h1>
-<p>This page covers the basic configuration options for running an L1 node with ethrex. Full list of options can be found at the <a href="../../CLI.html">CLI reference</a></p>
-<h2 id="sync-modes"><a class="header" href="#sync-modes">Sync Modes</a></h2>
-<p>Ethrex supports different sync modes for node operation:</p>
-<ul>
-<li><strong>full</strong>: Downloads and verifies the entire chain.</li>
-<li><strong>snap</strong>: Fast sync using state snapshots (recommended for most users).</li>
-</ul>
-<p>Set the sync mode with:</p>
-<pre><code class="language-sh">ethrex --sync &lt;mode&gt;
-</code></pre>
-<h2 id="file-locations"><a class="header" href="#file-locations">File Locations</a></h2>
-<p>By default, ethrex stores its data in:</p>
-<ul>
-<li>Linux: <code>~/.local/share/ethrex</code></li>
-<li>macOS: <code>~/Library/Application Support/ethrex</code></li>
-</ul>
-<p>You can change the data directory with:</p>
-<pre><code class="language-sh">ethrex --datadir &lt;path&gt;
-</code></pre>
-<h2 id="ports"><a class="header" href="#ports">Ports</a></h2>
-<p>Default ports used by ethrex:</p>
-<ul>
-<li><code>8545</code>: JSON-RPC (HTTP)</li>
-<li><code>8551</code>: Auth JSON-RPC</li>
-<li><code>30303</code>: P2P networking (TCP/UDP)</li>
-<li><code>9090</code>: Metrics</li>
-</ul>
-<p>You can change ports with the corresponding flags: <code>--http.port</code>, <code>--authrpc.port</code>, <code>--p2p.port</code>, <code>--discovery.port</code>, <code>--metrics.port</code>.</p>
-<p>All services listen on <code>0.0.0.0</code> by default, except for the auth RPC, which listens on <code>127.0.0.1</code>. This can also be changed with flags (e.g., <code>--http.addr</code>).</p>
-<h2 id="log-levels"><a class="header" href="#log-levels">Log Levels</a></h2>
-<p>Control log verbosity with:</p>
-<pre><code class="language-sh">ethrex --log.level &lt;level&gt;
-</code></pre>
-<p>Levels: <code>error</code>, <code>warn</code>, <code>info</code> (default), <code>debug</code>, <code>trace</code></p>
-<h2 id="dev-mode-localnet"><a class="header" href="#dev-mode-localnet">Dev Mode (Localnet)</a></h2>
-<p>For local development and testing, you can use dev mode:</p>
-<pre><code class="language-sh">ethrex --dev
-</code></pre>
-<p>This runs a local network with block production and no external peers. This network has a list of <a href="https://github.com/lambdaclass/ethrex/blob/main/fixtures/keys/private_keys_l1.txt">predefined accounts</a> with funds for testing purposes.</p>
+<h2 id="faq"><a class="header" href="#faq">FAQ</a></h2>
+<h3 id="whats-the-difference-between-eth_getproof-and-debug_executionwitness"><a class="header" href="#whats-the-difference-between-eth_getproof-and-debug_executionwitness">What's the difference between <code>eth_getProof</code> and <code>debug_executionWitness</code>?</a></h3>
+<p><code>eth_getProof</code> gets the proof for a particular account and the chosen storage slots.
+<code>debug_executionWitness</code> gets the whole execution witness necessary to execute a block in a stateless manner.</p>
+<p>The former endpoint is implemented by all execution clients and you can even find it in RPC Providers like Alchemy, the latter is only implemented by some execution clients and you can't find it in RPC Providers.</p>
+<p>When wanting to execute a historical block we tend to use the <code>eth_getProof</code> method with an RPC Provider because it will be the most reliable, other way is using it against a Hash-Based Archive Node but this would be too heavy to host ourselves (20TB at least). This method is slow because it performs many requests but it's very flexible.</p>
+<p>If instead we want to execute a recent block we use it against synced ethrex or reth nodes that expose the <code>debug_executionWitness</code> endpoint, this way retrieval of data will be instant and it will be way faster than the other method, because it won't be doing thousands of RPC requests, just one.</p>
+<p>More information regarding the execution witness in <a href="https://github.com/lambdaclass/ethrex/blob/38e0ffc/docs/l2/architecture/prover.md#execution-witness">the prover docs</a>.</p>
+<h3 id="why-stateless-execution-of-some-blocks-doesnt-work-with-eth_getproof"><a class="header" href="#why-stateless-execution-of-some-blocks-doesnt-work-with-eth_getproof">Why stateless execution of some blocks doesn't work with <code>eth_getProof</code></a></h3>
+<p>With this method of execution we get the proof of all the accounts and storage slots accessed during execution, but the problem arises when we want to delete a node from the Merkle Patricia Trie (MPT) when applying the account updates of the block. This is for a particular case in which a tree restructuring happens and we have a missing node that wasn't accessed but we need to know in order to restructure the trie.</p>
+<p>The problem can be explained with a simple example: a Branch node has 2 child nodes and only one was accessed and removed, this branch node should stop existing because they shouldn't have only <strong>one</strong> child. It will be either replaced by a leaf node or by an extension node, this depends on its child.</p>
+<p>This problem is wonderfully explained in <a href="https://github.com/kkrt-labs/zk-pig/blob/main/docs/modified-mpt.md">zkpig docs</a>, they also have a very good intro to the MPT.
+Here they mention two different solutions that we have to implement in order to fix this. The first one works when the missing node is a Leaf or Extension and the second one works then the missing node is a Branch.</p>
+<p>In our code we only applied the first solution by injecting all possible nodes to the execution witness that we build when using <code>eth_getProof</code>, that's why the witness when using this method will be larger than the witness obtained with <code>debug_executionWitness</code>.</p>
+<p>We didn't apply the second change because it needs a change to the MPT that we don't want in our code. However we were able to solve it for execution without using a zkVM by injecting some "fake nodes" to the trie just before execution that have the expected hash but their RLP content doesn't match to it. This way we can "trick" the Trie into thinking that it has the branch nodes when in fact, it doesn't.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../../l1/running/startup.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../ethrex_replay/ethrex_replay.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <i class="fa fa-angle-left"></i>
                             </a>
 
-                            <a rel="next prefetch" href="../../l1/running/monitoring.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../CLI.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <i class="fa fa-angle-right"></i>
                             </a>
 
@@ -296,11 +271,11 @@
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../../l1/running/startup.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../ethrex_replay/ethrex_replay.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <i class="fa fa-angle-left"></i>
                     </a>
 
-                    <a rel="next prefetch" href="../../l1/running/monitoring.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../CLI.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <i class="fa fa-angle-right"></i>
                     </a>
             </nav>
@@ -315,17 +290,17 @@
         </script>
 
 
-        <script src="../../elasticlunr.min.js"></script>
-        <script src="../../mark.min.js"></script>
-        <script src="../../searcher.js"></script>
+        <script src="../elasticlunr.min.js"></script>
+        <script src="../mark.min.js"></script>
+        <script src="../searcher.js"></script>
 
-        <script src="../../clipboard.min.js"></script>
-        <script src="../../highlight.js"></script>
-        <script src="../../book.js"></script>
+        <script src="../clipboard.min.js"></script>
+        <script src="../highlight.js"></script>
+        <script src="../book.js"></script>
 
         <!-- Custom JS scripts -->
-        <script src="../../mermaid.min.js"></script>
-        <script src="../../mermaid-init.js"></script>
+        <script src="../mermaid.min.js"></script>
+        <script src="../mermaid-init.js"></script>
 
 
     </div>
