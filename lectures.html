@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Sync modes - Ethrex</title>
+        <title>Recommended lectures - Ethrex</title>
 
 
         <!-- Custom HTML head -->
@@ -12,33 +12,33 @@
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="theme-color" content="#ffffff">
 
-        <link rel="icon" href="../../favicon.svg">
-        <link rel="shortcut icon" href="../../favicon.png">
-        <link rel="stylesheet" href="../../css/variables.css">
-        <link rel="stylesheet" href="../../css/general.css">
-        <link rel="stylesheet" href="../../css/chrome.css">
-        <link rel="stylesheet" href="../../css/print.css" media="print">
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
 
         <!-- Fonts -->
-        <link rel="stylesheet" href="../../FontAwesome/css/font-awesome.css">
-        <link rel="stylesheet" href="../../fonts/fonts.css">
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
 
         <!-- Highlight.js Stylesheets -->
-        <link rel="stylesheet" id="highlight-css" href="../../highlight.css">
-        <link rel="stylesheet" id="tomorrow-night-css" href="../../tomorrow-night.css">
-        <link rel="stylesheet" id="ayu-highlight-css" href="../../ayu-highlight.css">
+        <link rel="stylesheet" id="highlight-css" href="highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="ayu-highlight.css">
 
         <!-- Custom theme stylesheets -->
 
 
         <!-- Provide site root and default themes to javascript -->
         <script>
-            const path_to_root = "../../";
+            const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../../toc.js"></script>
+        <script src="toc.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -102,7 +102,7 @@
             <!-- populated by js -->
             <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
             <noscript>
-                <iframe class="sidebar-iframe-outer" src="../../toc.html"></iframe>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
             </noscript>
             <div id="sidebar-resize-handle" class="sidebar-resize-handle">
                 <div class="sidebar-resize-indicator"></div>
@@ -137,7 +137,7 @@
                     <h1 class="menu-title">Ethrex</h1>
 
                     <div class="right-buttons">
-                        <a href="../../print.html" title="Print this book" aria-label="Print this book">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
                             <i id="print-button" class="fa fa-print"></i>
                         </a>
                         <a href="https://github.com/lambdaclass/ethrex" title="Git repository" aria-label="Git repository">
@@ -237,41 +237,28 @@
 }
 
 </style>
-<h1 id="sync-modes"><a class="header" href="#sync-modes">Sync Modes</a></h1>
-<h2 id="full-sync"><a class="header" href="#full-sync">Full sync</a></h2>
-<p>Full syncing works by downloading and executing every block from genesis. This means that full syncing will only work for networks that started after <a href="https://ethereum.org/en/roadmap/merge/">The Merge</a>, as ethrex only supports post merge execution.</p>
-<h2 id="snap-sync"><a class="header" href="#snap-sync">Snap sync</a></h2>
-<p>Snap syncing is a much faster alternative to full sync that works by downloading and executing only the latest blocks from the network.</p>
-<p>A snap sync cycle begins by fetching all the block headers (via eth p2p) between the current head (latest canonical block) and the sync head (block hash sent by a forkChoiceUpdate).</p>
-<p>We will then fetch the block bodies from each header and at the same time select a pivot block (sync head - 64) and start rebuilding its state via snap p2p requests, if the pivot were to become stale during this rebuild we will select a newer pivot (sync head) and restart it.</p>
-<p>After we fully rebuilt the pivot state and fetched all the block bodies we will fetch and store the receipts for the range between the current head and the pivot (including it), and at the same time store all blocks in the same range and execute all blocks after the pivot (like in full sync).</p>
-<h3 id="snap-state-rebuild"><a class="header" href="#snap-state-rebuild">Snap State Rebuild</a></h3>
-<p>During snap sync we need to fully rebuild the pivot block's state.
-We can divide snap sync into 3 core processes: State Sync, Trie Rebuild, and Healing.
-The State Sync consists of downloading the plain state of the pivot block, aka the values on the leafs of the state &amp; storage tries. For this process we will divide the state trie into segments and fetch each segment in parallel. We will also be relying on two side processes, the <code>bytecode_fetcher</code> and the <code>storage_fetcher</code> which will both remain active throughout the state sync, and fetch the bytecodes and storages of each account downloaded during the state sync.
-The Trie Rebuild process works in the background while State Sync is active. It consists of two processes running in parallel, one to rebuild the state trie and one to rebuild the storage tries. Both will read the data downloaded by the State Sync but while the state rebuild works independently, the storage rebuild will wait for the <code>storage_fetcher</code> to advertise which storages have been fully downloaded before attempting to rebuild them.
-The Healing process consists of fixing any inconsistencies leftover from the State Sync &amp; Trie Rebuild processes after they finish. As state sync can spawn across multiple cycles with different pivot blocks the state will not be consistent with the latest pivot block, so we need to fetch all the nodes that the pivot's tries have and ours don't. The <code>bytecode_fetcher</code> and <code>storage_healer</code> processes will be involved to heal the bytecodes &amp; storages of each account healed by the main state heal process.
-Also, the <code>storage_healer</code> will be spawned earlier, during state sync so that it can begin healing the storages that couldn't be fetched due to pivot staleness.</p>
-<p>This diagram illustrates all the processes involved in snap sync:</p>
-<p><img src="./diagrams/SnapSync.drawio.png" alt="SnapSync" />.</p>
-<p>And this diagram shows the interaction between the different processes involved in State Sync, Trie Rebuild and Healing:
-<img src="./diagrams/StateSyncAndHealing.drawio.png" alt="StateSyncAndHealing" />.</p>
-<p>To exemplify how queue-like processes work we will explain how the <code>bytecode_fetcher</code> works:</p>
-<p>The <code>bytecode_fetcher</code> has its own channel where it receives code hashes from an active <code>rebuild_state_trie</code> process. Once a code hash is received, it is added to a pending queue. When the queue has enough messages for a full batch it will request a batch of bytecodes via snap p2p and store them. If a bytecode could not be fetched by the request (aka, we reached the response limit) it is added back to the pending queue. After the whole state is synced <code>fetch_snap_state</code> will send an empty list to the <code>bytecode_fetcher</code> to signal the end of the requests so it can request the last (incomplete) bytecode batch and end gracefully.</p>
-<p>This diagram illustrates the process described above:</p>
-<p><img src="./diagrams/bytecode_fetcher.jpg" alt="snap_sync" /></p>
+<h1 id="recommended-lectures"><a class="header" href="#recommended-lectures">Recommended lectures</a></h1>
+<blockquote>
+<p><strong>Disclaimer</strong>: This section is under development. We’ll continue to expand it with more up-to-date materials over time.</p>
+</blockquote>
+<p>For those interested in deepening their understanding of Ethereum internals, execution clients, and related zero-knowledge and distributed systems topics, we recommend the following materials:</p>
+<ul>
+<li>
+<p><a href="https://x.com/megaeth_labs/status/1978854478943256986?s=12">ENDGAME: How MegaETH bridges throughput and decentralization</a></p>
+</li>
+<li>
+<p><a href="https://x.com/megaeth_labs/status/1962902246573879530?s=12">ENDGAME: How SALT breaks the bottleneck that's been strangling blockchains</a></p>
+</li>
+</ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../../l1/fundamentals/networking.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="CONTRIBUTING_DOCS.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <i class="fa fa-angle-left"></i>
                             </a>
 
-                            <a rel="next prefetch" href="../../internal/l1/healing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
-                                <i class="fa fa-angle-right"></i>
-                            </a>
 
                         <div style="clear: both"></div>
                     </nav>
@@ -279,13 +266,10 @@ Also, the <code>storage_healer</code> will be spawned earlier, during state sync
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../../l1/fundamentals/networking.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="CONTRIBUTING_DOCS.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <i class="fa fa-angle-left"></i>
                     </a>
 
-                    <a rel="next prefetch" href="../../internal/l1/healing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
-                        <i class="fa fa-angle-right"></i>
-                    </a>
             </nav>
 
         </div>
@@ -298,17 +282,17 @@ Also, the <code>storage_healer</code> will be spawned earlier, during state sync
         </script>
 
 
-        <script src="../../elasticlunr.min.js"></script>
-        <script src="../../mark.min.js"></script>
-        <script src="../../searcher.js"></script>
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
 
-        <script src="../../clipboard.min.js"></script>
-        <script src="../../highlight.js"></script>
-        <script src="../../book.js"></script>
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
 
         <!-- Custom JS scripts -->
-        <script src="../../mermaid.min.js"></script>
-        <script src="../../mermaid-init.js"></script>
+        <script src="mermaid.min.js"></script>
+        <script src="mermaid-init.js"></script>
 
 
     </div>
