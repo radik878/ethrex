@@ -158,6 +158,11 @@ struct MempoolInner {
     /// but whose responses haven't arrived yet. Used to avoid sending duplicate
     /// requests when multiple peers announce the same transaction.
     in_flight_txs: FxHashSet<H256>,
+    /// Hashes of transactions admitted with `--mempool.private` set: they
+    /// MUST NOT be propagated to peers via any P2P path (broadcast,
+    /// new-peer pooled-hash dump, or `GetPooledTransactions` responses).
+    /// Cleared on transaction removal alongside `broadcast_pool`.
+    private_pool: FxHashSet<H256>,
     /// For each announced hash, the queue of *alternate* announcers that also
     /// advertised it while the hash was already in-flight from someone else.
     /// Each entry carries the announcer's own announced type and size so the
@@ -225,6 +230,7 @@ impl MempoolInner {
 
         self.txs_by_sender_nonce.remove(&(tx.sender(), tx.nonce()));
         self.broadcast_pool.remove(hash);
+        self.private_pool.remove(hash);
 
         // Clear ALL frame-tx reservation state in this single removal path
         // (eviction / inclusion / reorg all funnel through here), so no outer
@@ -632,6 +638,9 @@ impl Mempool {
     /// gates read the live pool state the insert will mutate. Executable
     /// (contiguous-nonce) txs are never queued-capped, so a single sender can
     /// hold arbitrarily many (bounded only by the global mempool size).
+    ///
+    /// The transaction's hash is queued for P2P broadcast. Use
+    /// [`Self::add_transaction_no_broadcast`] for the private-mempool path.
     pub fn add_transaction(
         &self,
         hash: H256,
@@ -639,6 +648,48 @@ impl Mempool {
         transaction: MempoolTransaction,
         frame_reservation: Option<FramePaymasterReservation>,
         sender_admission: Option<SenderAdmission>,
+    ) -> Result<(), MempoolError> {
+        self.add_transaction_inner(
+            hash,
+            sender,
+            transaction,
+            frame_reservation,
+            sender_admission,
+            true,
+        )
+    }
+
+    /// Add transaction to the pool without queueing it for P2P broadcast.
+    /// Used by the private-mempool path: the tx is available to the local
+    /// payload builder but never gossiped to peers. Admission gating is
+    /// identical to [`Self::add_transaction`] — only propagation differs.
+    pub fn add_transaction_no_broadcast(
+        &self,
+        hash: H256,
+        sender: Address,
+        transaction: MempoolTransaction,
+        frame_reservation: Option<FramePaymasterReservation>,
+        sender_admission: Option<SenderAdmission>,
+    ) -> Result<(), MempoolError> {
+        self.add_transaction_inner(
+            hash,
+            sender,
+            transaction,
+            frame_reservation,
+            sender_admission,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_transaction_inner(
+        &self,
+        hash: H256,
+        sender: Address,
+        transaction: MempoolTransaction,
+        frame_reservation: Option<FramePaymasterReservation>,
+        sender_admission: Option<SenderAdmission>,
+        broadcast: bool,
     ) -> Result<(), MempoolError> {
         let mut inner = self.write()?;
         let is_frame = matches!(transaction.tx_type(), TxType::Frame);
@@ -778,7 +829,13 @@ impl Mempool {
         let tx_nonce = transaction.nonce();
         inner.txs_by_sender_nonce.insert((sender, tx_nonce), hash);
         inner.transaction_pool.insert(hash, transaction);
-        inner.broadcast_pool.insert(hash);
+        // Private txs are held for local block building only: they never enter
+        // the broadcast pool, so no P2P path can pick them up.
+        if broadcast {
+            inner.broadcast_pool.insert(hash);
+        } else {
+            inner.private_pool.insert(hash);
+        }
         inner.alternates.remove(&hash);
 
         // Track per-sender pending frame tx for EIP-8141 admission gating.
@@ -1256,6 +1313,38 @@ impl Mempool {
         Ok(contains)
     }
 
+    /// Returns `true` if the transaction was admitted with `--mempool.private`
+    /// set (via [`Self::add_transaction_no_broadcast`]). Callers on the P2P
+    /// path MUST consult this before serving the tx to peers — the private
+    /// pool intentionally bypasses gossip, the new-peer pooled-hash dump,
+    /// and `GetPooledTransactions` responses.
+    pub fn is_private(&self, hash: H256) -> Result<bool, StoreError> {
+        Ok(self.read()?.private_pool.contains(&hash))
+    }
+
+    /// Returns all broadcast-eligible txs under a single read lock. Excludes
+    /// privileged txs and any tx in the private pool. Used by the new-peer
+    /// pooled-hashes dump so the caller takes one lock instead of one per tx.
+    pub fn get_txs_for_new_peer_dump(&self) -> Result<Vec<MempoolTransaction>, StoreError> {
+        let inner = self.read()?;
+        let mut txs: Vec<MempoolTransaction> = inner
+            .transaction_pool
+            .iter()
+            .filter(|(hash, tx)| !inner.private_pool.contains(hash) && !tx.is_privileged())
+            .map(|(_, tx)| tx.clone())
+            .collect();
+        // Announce grouped by sender and ascending by nonce, matching what the
+        // previous `get_all_txs_by_sender`-based dump produced. This is NOT
+        // cosmetic: `transaction_pool` is a hash map, so an unsorted dump
+        // announces a sender's transactions in arbitrary order, and a peer that
+        // fetches them in that order sees nonce gaps. Gapped transactions are
+        // future/queued on the receiving side, so they can be turned away by
+        // the gap-admission gate or counted against the per-sender queued cap
+        // and never enter the peer's pool at all.
+        txs.sort_by(|a, b| a.sender().cmp(&b.sender()).then_with(|| a.cmp(b)));
+        Ok(txs)
+    }
+
     /// For the per-account **queued** (future-nonce) cap: if a tx at `tx_nonce`
     /// from `sender` would be a future/queued tx given the on-chain
     /// `account_nonce`, returns `Some(current_queued_count)` for the caller to
@@ -1575,6 +1664,65 @@ mod tests {
             nonce,
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn new_peer_dump_is_grouped_by_sender_and_nonce_ordered() {
+        // Regression: the dump reads from `transaction_pool`, a hash map, so
+        // without an explicit sort it emits a sender's txs in arbitrary order.
+        // The peer then fetches them out of nonce order, sees gaps, and its own
+        // gap-admission / queued-cap gates can turn them away — transactions
+        // silently never reach the peer's pool.
+        let pool = Mempool::new(64);
+        let a = Address::from_low_u64_be(0xA);
+        let b = Address::from_low_u64_be(0xB);
+
+        // Insert deliberately out of order, interleaving senders. `to` is
+        // derived from the sender so the two senders' txs hash differently —
+        // `dummy_mempool_tx` doesn't embed the sender, so same-nonce txs from
+        // different senders would otherwise collide on hash.
+        let make = |sender: Address, nonce: u64| {
+            let tx = Transaction::EIP1559Transaction(EIP1559Transaction {
+                nonce,
+                gas_limit: 21_000,
+                to: TxKind::Call(sender),
+                ..Default::default()
+            });
+            MempoolTransaction::new(tx, sender)
+        };
+        for (sender, nonce) in [(a, 2u64), (b, 1), (a, 0), (b, 0), (a, 1)] {
+            let mtx = make(sender, nonce);
+            let hash = mtx.hash(&NativeCrypto);
+            pool.add_transaction(hash, sender, mtx, None, None).unwrap();
+        }
+
+        let dumped = pool.get_txs_for_new_peer_dump().unwrap();
+        assert_eq!(dumped.len(), 5);
+
+        // Each sender's slice must be strictly ascending by nonce.
+        for sender in [a, b] {
+            let nonces: Vec<u64> = dumped
+                .iter()
+                .filter(|tx| tx.sender() == sender)
+                .map(|tx| tx.nonce())
+                .collect();
+            let mut sorted = nonces.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                nonces, sorted,
+                "dump must be nonce-ordered per sender, got {nonces:?} for {sender:?}"
+            );
+        }
+
+        // And a sender's txs must be contiguous, not interleaved with the other's.
+        let senders: Vec<Address> = dumped.iter().map(|tx| tx.sender()).collect();
+        let mut deduped = senders.clone();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            2,
+            "each sender's txs must form one contiguous run, got {senders:?}"
+        );
     }
 
     fn add_tx(pool: &Mempool, sender: Address, nonce: u64) -> H256 {

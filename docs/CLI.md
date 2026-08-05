@@ -111,6 +111,10 @@ Node options:
           [env: ETHREX_MEMPOOL_MAX_SIZE=]
           [default: 10000]
 
+      --mempool.private
+          Node-level config (not a protocol/EIP behavior): keep RPC-submitted transactions private. They enter the mempool and may be included in blocks built locally, but are not propagated to peers. P2P-received transactions are unaffected.
+
+          [env: ETHREX_MEMPOOL_PRIVATE=]
       --mempool.price-bump <PERCENT>
           Minimum fee bump (in percent) required to replace a non-blob pooled transaction at the same (sender, nonce).
 

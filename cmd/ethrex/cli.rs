@@ -240,6 +240,15 @@ pub struct Options {
     )]
     pub mempool_max_size: usize,
     #[arg(
+        long = "mempool.private",
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        help = "Node-level config (not a protocol/EIP behavior): keep RPC-submitted transactions private. They enter the mempool and may be included in blocks built locally, but are not propagated to peers. P2P-received transactions are unaffected.",
+        help_heading = "Node options",
+        env = "ETHREX_MEMPOOL_PRIVATE"
+    )]
+    pub mempool_private: bool,
+    #[arg(
         help = "Minimum fee bump (in percent) required to replace a non-blob pooled transaction at the same (sender, nonce).",
         long = "mempool.price-bump",
         default_value_t = DEFAULT_PRICE_BUMP_PERCENT,
@@ -566,6 +575,7 @@ impl Default for Options {
             dev: Default::default(),
             force: false,
             mempool_max_size: Default::default(),
+            mempool_private: false,
             mempool_price_bump: DEFAULT_PRICE_BUMP_PERCENT,
             mempool_blob_price_bump: DEFAULT_BLOB_PRICE_BUMP_PERCENT,
             mempool_gap_admit_occupancy_threshold: DEFAULT_GAP_ADMIT_OCCUPANCY_THRESHOLD,
