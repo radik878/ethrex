@@ -36,6 +36,8 @@ pub fn execution_program(
         last_block_hash,
         non_privileged_count,
         chain_id,
+        burned_fees: _,
+        bals: _,
     } = execute_blocks(
         &blocks,
         execution_witness,
@@ -50,6 +52,7 @@ pub fn execution_program(
             Evm::new_for_l2(db.clone(), fee_config, crypto.clone())
                 .map_err(crate::common::ExecutionError::Evm)
         },
+        crypto.clone(),
     )?;
 
     // Extract and process messages

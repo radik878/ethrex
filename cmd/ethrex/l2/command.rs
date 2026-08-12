@@ -101,6 +101,10 @@ impl L2Command {
                 Some(contract_addresses.bridge_address);
             println!("Initializing L2");
         }
+        if l2_options.sequencer_opts.native_rollups {
+            l2::init_native_rollup_l2(l2_options, log_filter_handler).await?;
+            return Ok(());
+        }
         l2::init_l2(l2_options, log_filter_handler).await?;
         Ok(())
     }
@@ -289,7 +293,7 @@ impl Command {
         match self {
             Command::Prover {
                 prover_client_options,
-            } => ethrex_prover_lib::init_client(prover_client_options.into()).await,
+            } => ethrex_l2_prover::init_client(prover_client_options.into()).await,
             Self::RemoveDB { datadir, force } => {
                 remove_db(&datadir, force);
             }
@@ -305,13 +309,13 @@ impl Command {
                 let beacon_client = BeaconClient::new(l1_beacon_rpc);
 
                 // Keep delay for finality
-                let mut current_block = U256::zero();
-                while current_block < U256::from(64) {
+                let mut current_block = 0u64;
+                while current_block < 64 {
                     current_block = eth_client.get_block_number().await?;
                     tokio::time::sleep(Duration::from_secs(12)).await;
                 }
                 current_block = current_block
-                    .checked_sub(U256::from(64))
+                    .checked_sub(64)
                     .ok_or_eyre("Cannot get finalized block")?;
 
                 let event_signature = keccak("BatchCommitted(bytes32)");
@@ -322,8 +326,8 @@ impl Command {
 
                     let logs = eth_client
                         .get_logs(
-                            current_block,
-                            current_block,
+                            U256::from(current_block),
+                            U256::from(current_block),
                             contract_address,
                             vec![event_signature],
                         )
@@ -332,10 +336,7 @@ impl Command {
                     if !logs.is_empty() {
                         // Get parent beacon block root hash from block
                         let block = eth_client
-                            .get_block_by_number(
-                                BlockIdentifier::Number(current_block.as_u64()),
-                                false,
-                            )
+                            .get_block_by_number(BlockIdentifier::Number(current_block), false)
                             .await?;
                         let parent_beacon_hash = block
                             .header
@@ -375,7 +376,7 @@ impl Command {
                         println!("Saved blobs for slot {target_slot}");
                     }
 
-                    current_block += U256::one();
+                    current_block += 1;
                 }
             }
             Command::Reconstruct {
@@ -497,6 +498,7 @@ impl Command {
                         latest_hash_on_batch,
                         latest_hash_on_batch,
                         latest_hash_on_batch,
+                        None,
                     )
                     .await?;
 
@@ -622,6 +624,10 @@ impl Command {
                     .inspect(|_| info!("Succesfully unpaused contract"))?;
             }
             Command::Deploy { options } => {
+                if options.native_rollups {
+                    l2::deployer::deploy_native_rollup_contracts(options).await?;
+                    return Ok(());
+                }
                 deploy_l1_contracts(options).await?;
             }
         }
@@ -679,7 +685,7 @@ impl ContractCallOptions {
 
 async fn delete_batch_from_rollup_store(batch: u64, rollup_store_dir: &Path) -> eyre::Result<u64> {
     info!("Deleting batch from rollup store...");
-    let rollup_store = l2::initializers::init_rollup_store(rollup_store_dir).await;
+    let rollup_store = l2::init_rollup_store(rollup_store_dir).await;
     let last_kept_block = rollup_store
         .get_block_numbers_by_batch(batch)
         .await?

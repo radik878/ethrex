@@ -104,7 +104,7 @@ impl Database for TestDatabase {
         for acc in self.accounts.values() {
             if acc.info.code_hash == code_hash {
                 return Ok(CodeMetadata {
-                    length: acc.code.bytecode.len() as u64,
+                    length: acc.code.len() as u64,
                 });
             }
         }
@@ -119,13 +119,18 @@ fn eoa(balance: U256) -> Account {
 }
 
 fn contract_with_storage(code: Bytes, storage: FxHashMap<H256, U256>) -> Account {
-    Account::new(U256::zero(), Code::from_bytecode(code), 0, storage)
+    Account::new(
+        U256::zero(),
+        Code::from_bytecode(code, &NativeCrypto),
+        0,
+        storage,
+    )
 }
 
 fn contract(code: Bytes) -> Account {
     Account::new(
         U256::zero(),
-        Code::from_bytecode(code),
+        Code::from_bytecode(code, &NativeCrypto),
         0,
         FxHashMap::default(),
     )
@@ -347,6 +352,7 @@ fn fee_token_ratio_cached_between_prepare_and_finalize() {
         LevmCallTracer::disabled(),
         VMType::L2(fee_config),
         &NativeCrypto,
+        None,
     )
     .expect("VM creation should succeed");
 

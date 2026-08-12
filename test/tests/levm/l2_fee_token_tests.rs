@@ -84,7 +84,7 @@ impl Database for TestDatabase {
         for acc in self.accounts.values() {
             if acc.info.code_hash == code_hash {
                 return Ok(CodeMetadata {
-                    length: acc.code.bytecode.len() as u64,
+                    length: acc.code.len() as u64,
                 });
             }
         }
@@ -101,7 +101,7 @@ fn eoa(balance: U256, nonce: u64) -> Account {
 fn contract_account(code: Bytes) -> Account {
     Account::new(
         U256::zero(),
-        Code::from_bytecode(code),
+        Code::from_bytecode(code, &NativeCrypto),
         0,
         FxHashMap::default(),
     )
@@ -185,6 +185,8 @@ fn fee_token_lock_reverted_on_validation_failure() {
         is_privileged: false,
         fee_token: Some(fee_token),
         disable_balance_check: false,
+        disable_nonce_check: false,
+        is_system_call: false,
     };
 
     let tx = Transaction::EIP1559Transaction(EIP1559Transaction {
@@ -204,6 +206,7 @@ fn fee_token_lock_reverted_on_validation_failure() {
         LevmCallTracer::disabled(),
         VMType::L2(Default::default()),
         &NativeCrypto,
+        None,
     )
     .unwrap();
 

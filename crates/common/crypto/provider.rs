@@ -1,3 +1,10 @@
+#[cfg(not(feature = "std"))]
+use alloc::{
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+
 use ethereum_types::Address;
 use sha2::Digest as _;
 
@@ -16,9 +23,19 @@ pub enum CryptoError {
     InvalidInput(&'static str),
     #[error("verification failed")]
     VerificationFailed,
+    #[error("unsupported: {0}")]
+    Unsupported(&'static str),
     #[error("{0}")]
     Other(String),
 }
+
+/// Error returned by the BLS12-381 trait defaults when no backend is available:
+/// the host backend (`blst`) is compiled out and no provider override is in
+/// place. zkVM guest providers override these methods, so this is never hit on
+/// the guest; on the host the `blst` feature (default-on) supplies the backend.
+#[cfg(not(feature = "blst"))]
+const BLS_UNSUPPORTED: &str =
+    "bls12_381 requires the `blst` feature (host/L1) or a zkVM provider override";
 
 /// All cryptographic operations the EVM needs.
 ///
@@ -56,72 +73,111 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
     /// Recover the Ethereum address from a 64-byte signature + recovery id + 32-byte message hash.
     /// Used by the ECRECOVER precompile (0x01).
     /// Returns the 32-byte keccak hash of the uncompressed public key (address is last 20 bytes).
+    #[cfg(feature = "secp256k1")]
     fn secp256k1_ecrecover(
         &self,
         sig: &[u8; 64],
         recid: u8,
         msg: &[u8; 32],
     ) -> Result<[u8; 32], CryptoError> {
-        #[cfg(feature = "secp256k1")]
-        {
-            let recovery_id = secp256k1::ecdsa::RecoveryId::try_from(recid as i32)
-                .map_err(|_| CryptoError::InvalidRecoveryId)?;
+        let recovery_id = secp256k1::ecdsa::RecoveryId::try_from(recid as i32)
+            .map_err(|_| CryptoError::InvalidRecoveryId)?;
 
-            let recoverable_sig =
-                secp256k1::ecdsa::RecoverableSignature::from_compact(sig, recovery_id)
-                    .map_err(|_| CryptoError::InvalidSignature)?;
+        let recoverable_sig =
+            secp256k1::ecdsa::RecoverableSignature::from_compact(sig, recovery_id)
+                .map_err(|_| CryptoError::InvalidSignature)?;
 
-            let message = secp256k1::Message::from_digest(*msg);
+        let message = secp256k1::Message::from_digest(*msg);
 
-            let public_key = recoverable_sig
-                .recover(&message)
-                .map_err(|_| CryptoError::RecoveryFailed)?;
+        let public_key = recoverable_sig
+            .recover(&message)
+            .map_err(|_| CryptoError::RecoveryFailed)?;
 
-            let hash = crate::keccak::keccak_hash(&public_key.serialize_uncompressed()[1..]);
-            Ok(hash)
+        let hash = crate::keccak::keccak_hash(&public_key.serialize_uncompressed()[1..]);
+        Ok(hash)
+    }
+
+    #[cfg(not(feature = "secp256k1"))]
+    fn secp256k1_ecrecover(
+        &self,
+        sig: &[u8; 64],
+        recid: u8,
+        msg: &[u8; 32],
+    ) -> Result<[u8; 32], CryptoError> {
+        use k256::{
+            AffinePoint, ProjectivePoint, Scalar,
+            elliptic_curve::{
+                PrimeField,
+                group::prime::PrimeCurveAffine,
+                ops::{Invert, LinearCombination, Reduce},
+                point::DecompressPoint,
+                sec1::ToEncodedPoint,
+            },
+        };
+
+        // Parse r and s as scalars, rejecting values >= curve order
+        let r_bytes = k256::FieldBytes::from_slice(&sig[..32]);
+        let s_bytes = k256::FieldBytes::from_slice(&sig[32..]);
+        let r: Option<Scalar> = Scalar::from_repr(*r_bytes).into();
+        let s: Option<Scalar> = Scalar::from_repr(*s_bytes).into();
+
+        let (Some(r), Some(s)) = (r, s) else {
+            return Err(CryptoError::InvalidSignature);
+        };
+
+        if r.is_zero().into() || s.is_zero().into() {
+            return Err(CryptoError::InvalidSignature);
         }
-        #[cfg(not(feature = "secp256k1"))]
-        {
-            let _ = (sig, recid, msg);
-            Err(CryptoError::Other("secp256k1 feature not enabled".into()))
+
+        // Decompress R from r and recovery id parity.
+        // Note: recid >= 2 means R.x = r + n (curve order), which has ~2^-128
+        // probability on secp256k1 and never occurs in practice. We don't handle
+        // it here — decompression will simply fail and return RecoveryFailed.
+        let y_is_odd = (recid & 1) != 0;
+        let r_point: Option<AffinePoint> =
+            AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into();
+        let Some(r_point) = r_point else {
+            return Err(CryptoError::RecoveryFailed);
+        };
+
+        // Recover public key: pk = r^(-1) * (s*R - z*G)
+        let r_proj = ProjectivePoint::from(r_point);
+        let z = <Scalar as Reduce<k256::U256>>::reduce_bytes(k256::FieldBytes::from_slice(msg));
+        let r_inv: Option<Scalar> = r.invert_vartime().into();
+        let Some(r_inv) = r_inv else {
+            return Err(CryptoError::RecoveryFailed);
+        };
+        let u1 = -(r_inv * z);
+        let u2 = r_inv * s;
+        let pk = ProjectivePoint::lincomb(&ProjectivePoint::GENERATOR, &u1, &r_proj, &u2);
+
+        let pk_affine = pk.to_affine();
+        if bool::from(pk_affine.is_identity()) {
+            return Err(CryptoError::RecoveryFailed);
         }
+        let uncompressed = pk_affine.to_encoded_point(false);
+        let hash = crate::keccak::keccak_hash(&uncompressed.as_bytes()[1..]);
+        Ok(hash)
     }
 
     /// Recover the signer address from a 65-byte signature (r||s||v) + 32-byte message hash.
     /// Used by transaction validation (tx.sender()) and EIP-7702 authority recovery.
     fn recover_signer(&self, sig: &[u8; 65], msg: &[u8; 32]) -> Result<Address, CryptoError> {
-        #[cfg(feature = "secp256k1")]
-        {
-            // EIP-2: reject high-s signatures (s > secp256k1n/2)
-            const SECP256K1_N_HALF: [u8; 32] = hex_literal::hex!(
-                "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0"
-            );
-            if sig[32..64] > SECP256K1_N_HALF[..] {
-                return Err(CryptoError::InvalidSignature);
-            }
-
-            let recid_byte = sig[64] as i32;
-            let recovery_id = secp256k1::ecdsa::RecoveryId::try_from(recid_byte)
-                .map_err(|_| CryptoError::InvalidRecoveryId)?;
-
-            let recoverable_sig =
-                secp256k1::ecdsa::RecoverableSignature::from_compact(&sig[..64], recovery_id)
-                    .map_err(|_| CryptoError::InvalidSignature)?;
-
-            let message = secp256k1::Message::from_digest(*msg);
-
-            let public_key = secp256k1::SECP256K1
-                .recover_ecdsa(&message, &recoverable_sig)
-                .map_err(|_| CryptoError::RecoveryFailed)?;
-
-            let hash = crate::keccak::keccak_hash(&public_key.serialize_uncompressed()[1..]);
-            Ok(Address::from_slice(&hash[12..]))
+        // EIP-2: reject high-s signatures (s > secp256k1n/2)
+        const SECP256K1_N_HALF: [u8; 32] =
+            hex_literal::hex!("7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0");
+        if sig[32..64] > SECP256K1_N_HALF[..] {
+            return Err(CryptoError::InvalidSignature);
         }
-        #[cfg(not(feature = "secp256k1"))]
-        {
-            let _ = (sig, msg);
-            Err(CryptoError::Other("secp256k1 feature not enabled".into()))
-        }
+
+        let hash = self.secp256k1_ecrecover(
+            sig[..64]
+                .try_into()
+                .map_err(|_| CryptoError::InvalidSignature)?,
+            sig[64],
+            msg,
+        )?;
+        Ok(Address::from_slice(&hash[12..]))
     }
 
     // ── Hashing ────────────────────────────────────────────────────────
@@ -194,7 +250,7 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
         use ark_bn254::{Fq, Fr as FrArk};
         use ark_ec::CurveGroup;
         use ark_ff::{BigInteger, PrimeField as _, Zero};
-        use std::ops::Mul as _;
+        use core::ops::Mul as _;
 
         if point.len() < 64 || scalar.len() < 32 {
             return Err(CryptoError::InvalidInput("invalid input length"));
@@ -287,6 +343,7 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
 
     /// Modular exponentiation (arbitrary precision).
     /// Used by MODEXP precompile (0x05).
+    #[cfg(feature = "std")]
     fn modexp(&self, base: &[u8], exp: &[u8], modulus: &[u8]) -> Result<Vec<u8>, CryptoError> {
         use malachite::base::num::arithmetic::traits::ModPow as _;
         use malachite::base::num::basic::traits::Zero as _;
@@ -308,17 +365,28 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
             base_mod.mod_pow(&exp_nat, &mod_nat)
         };
 
-        let modulus_len = modulus.len();
         let res_bytes: Vec<u8> = result.to_power_of_2_digits_desc(8);
+        pad_modexp_output(res_bytes, modulus.len())
+    }
 
-        let mut out = vec![0u8; modulus_len];
-        if res_bytes.len() <= modulus_len {
-            let offset = modulus_len - res_bytes.len();
-            out[offset..].copy_from_slice(&res_bytes);
+    #[cfg(not(feature = "std"))]
+    fn modexp(&self, base: &[u8], exp: &[u8], modulus: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        use num_bigint::BigUint;
+
+        let base_nat = BigUint::from_bytes_be(base);
+        let exp_nat = BigUint::from_bytes_be(exp);
+        let mod_nat = BigUint::from_bytes_be(modulus);
+
+        let result = if mod_nat == BigUint::ZERO {
+            BigUint::ZERO
+        } else if exp_nat == BigUint::ZERO {
+            BigUint::from(1_u8) % &mod_nat
         } else {
-            out.copy_from_slice(&res_bytes[res_bytes.len() - modulus_len..]);
-        }
-        Ok(out)
+            base_nat.modpow(&exp_nat, &mod_nat)
+        };
+
+        let res_bytes = result.to_bytes_be();
+        pad_modexp_output(res_bytes, modulus.len())
     }
 
     /// 256-bit modular multiplication.
@@ -432,12 +500,20 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
     #[cfg(not(feature = "c-kzg"))]
     fn verify_kzg_proof(
         &self,
-        _z: &[u8; 32],
-        _y: &[u8; 32],
-        _commitment: &[u8; 48],
-        _proof: &[u8; 48],
+        z: &[u8; 32],
+        y: &[u8; 32],
+        commitment: &[u8; 48],
+        proof: &[u8; 48],
     ) -> Result<(), CryptoError> {
-        Err(CryptoError::Other("c-kzg feature not enabled".to_string()))
+        crate::kzg::verify_kzg_proof(*commitment, *z, *y, *proof)
+            .map_err(|e| CryptoError::Other(e.to_string()))
+            .and_then(|valid| {
+                if valid {
+                    Ok(())
+                } else {
+                    Err(CryptoError::VerificationFailed)
+                }
+            })
     }
 
     /// Verify blob KZG proof. Used by blob transaction validation.
@@ -463,14 +539,29 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
     #[cfg(not(feature = "c-kzg"))]
     fn verify_blob_kzg_proof(
         &self,
-        _blob: &[u8],
-        _commitment: &[u8; 48],
-        _proof: &[u8; 48],
+        blob: &[u8],
+        commitment: &[u8; 48],
+        proof: &[u8; 48],
     ) -> Result<bool, CryptoError> {
-        Err(CryptoError::Other("c-kzg feature not enabled".to_string()))
+        use crate::kzg::BYTES_PER_BLOB;
+
+        let blob_arr: [u8; BYTES_PER_BLOB] = blob
+            .try_into()
+            .map_err(|_| CryptoError::InvalidInput("blob must be 131072 bytes"))?;
+
+        crate::kzg::verify_blob_kzg_proof(blob_arr, *commitment, *proof)
+            .map_err(|e| CryptoError::Other(e.to_string()))
     }
 
     // ── BLS12-381 (Prague, EIP-2537) ───────────────────────────────────
+
+    // The BLS12-381 (EIP-2537) operations default to the assembly-optimized
+    // `blst` backend on the host (the `blst` feature, default-on). When `blst`
+    // is compiled out — i.e. zkVM guest builds — these defaults return an error
+    // and the guest `Crypto` providers (Sp1/Risc0/OpenVm via the portable
+    // `bls12_381` crate, Zisk via FFI) override every one of them. The portable
+    // pure-Rust implementation lives in `ethrex-guest-program`, so the published
+    // `ethrex-crypto` crate carries no git dependency.
 
     /// G1 addition. Returns 96-byte unpadded G1 point.
     fn bls12_381_g1_add(
@@ -478,14 +569,15 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
         a: ([u8; 48], [u8; 48]),
         b: ([u8; 48], [u8; 48]),
     ) -> Result<[u8; 96], CryptoError> {
-        use bls12_381::{G1Affine, G1Projective};
-
-        let pa = parse_bls12_g1(a)?;
-        let pb = parse_bls12_g1(b)?;
-
-        #[allow(clippy::arithmetic_side_effects)]
-        let result = G1Affine::from(G1Projective::from(pa) + G1Projective::from(pb));
-        serialize_bls12_g1(&result)
+        #[cfg(feature = "blst")]
+        {
+            crate::bls_blst::g1_add(a, b)
+        }
+        #[cfg(not(feature = "blst"))]
+        {
+            let _ = (a, b);
+            Err(CryptoError::Unsupported(BLS_UNSUPPORTED))
+        }
     }
 
     /// G1 multi-scalar multiplication. Returns 96-byte unpadded G1 point.
@@ -494,29 +586,15 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
         &self,
         pairs: &[(([u8; 48], [u8; 48]), [u8; 32])],
     ) -> Result<[u8; 96], CryptoError> {
-        use bls12_381::{G1Affine, G1Projective};
-        use ff::Field as _;
-
-        let mut result = G1Projective::identity();
-
-        for (point_bytes, scalar_bytes) in pairs {
-            let point = parse_bls12_g1(*point_bytes)?;
-            if !bool::from(point.is_torsion_free()) {
-                return Err(CryptoError::InvalidPoint("G1 point not in subgroup"));
-            }
-            let scalar = parse_bls12_scalar(scalar_bytes);
-
-            if !bool::from(scalar.is_zero()) {
-                #[allow(clippy::arithmetic_side_effects)]
-                let scaled: G1Projective = G1Projective::from(point) * scalar;
-                #[allow(clippy::arithmetic_side_effects)]
-                {
-                    result += scaled;
-                }
-            }
+        #[cfg(feature = "blst")]
+        {
+            crate::bls_blst::g1_msm(pairs)
         }
-
-        serialize_bls12_g1(&G1Affine::from(result))
+        #[cfg(not(feature = "blst"))]
+        {
+            let _ = pairs;
+            Err(CryptoError::Unsupported(BLS_UNSUPPORTED))
+        }
     }
 
     /// G2 addition. Returns 192-byte unpadded G2 point.
@@ -525,14 +603,15 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
         a: ([u8; 48], [u8; 48], [u8; 48], [u8; 48]),
         b: ([u8; 48], [u8; 48], [u8; 48], [u8; 48]),
     ) -> Result<[u8; 192], CryptoError> {
-        use bls12_381::{G2Affine, G2Projective};
-
-        let pa = parse_bls12_g2(a)?;
-        let pb = parse_bls12_g2(b)?;
-
-        #[allow(clippy::arithmetic_side_effects)]
-        let result = G2Affine::from(G2Projective::from(pa) + G2Projective::from(pb));
-        serialize_bls12_g2(&result)
+        #[cfg(feature = "blst")]
+        {
+            crate::bls_blst::g2_add(a, b)
+        }
+        #[cfg(not(feature = "blst"))]
+        {
+            let _ = (a, b);
+            Err(CryptoError::Unsupported(BLS_UNSUPPORTED))
+        }
     }
 
     /// G2 multi-scalar multiplication. Returns 192-byte unpadded G2 point.
@@ -541,29 +620,15 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
         &self,
         pairs: &[(([u8; 48], [u8; 48], [u8; 48], [u8; 48]), [u8; 32])],
     ) -> Result<[u8; 192], CryptoError> {
-        use bls12_381::{G2Affine, G2Projective};
-        use ff::Field as _;
-
-        let mut result = G2Projective::identity();
-
-        for (point_bytes, scalar_bytes) in pairs {
-            let point = parse_bls12_g2(*point_bytes)?;
-            if !bool::from(point.is_torsion_free()) {
-                return Err(CryptoError::InvalidPoint("G2 point not in subgroup"));
-            }
-            let scalar = parse_bls12_scalar(scalar_bytes);
-
-            if !bool::from(scalar.is_zero()) {
-                #[allow(clippy::arithmetic_side_effects)]
-                let scaled: G2Projective = G2Projective::from(point) * scalar;
-                #[allow(clippy::arithmetic_side_effects)]
-                {
-                    result += scaled;
-                }
-            }
+        #[cfg(feature = "blst")]
+        {
+            crate::bls_blst::g2_msm(pairs)
         }
-
-        serialize_bls12_g2(&G2Affine::from(result))
+        #[cfg(not(feature = "blst"))]
+        {
+            let _ = pairs;
+            Err(CryptoError::Unsupported(BLS_UNSUPPORTED))
+        }
     }
 
     /// BLS12-381 pairing check.
@@ -575,161 +640,58 @@ pub trait Crypto: Send + Sync + core::fmt::Debug {
             ([u8; 48], [u8; 48], [u8; 48], [u8; 48]),
         )],
     ) -> Result<bool, CryptoError> {
-        use bls12_381::{G1Affine, G2Prepared, Gt, multi_miller_loop};
-
-        let mut points: Vec<(G1Affine, G2Prepared)> = Vec::with_capacity(pairs.len());
-
-        for (g1_bytes, g2_bytes) in pairs {
-            let g1 = parse_bls12_g1(*g1_bytes)?;
-            let g2 = parse_bls12_g2(*g2_bytes)?;
-            // EIP-2537: pairing requires subgroup membership
-            if !bool::from(g1.is_torsion_free()) {
-                return Err(CryptoError::InvalidPoint("G1 not in subgroup"));
-            }
-            if !bool::from(g2.is_torsion_free()) {
-                return Err(CryptoError::InvalidPoint("G2 not in subgroup"));
-            }
-            points.push((g1, G2Prepared::from(g2)));
+        #[cfg(feature = "blst")]
+        {
+            crate::bls_blst::pairing_check(pairs)
         }
-
-        let refs: Vec<(&G1Affine, &G2Prepared)> = points.iter().map(|(g1, g2)| (g1, g2)).collect();
-
-        let result: Gt = multi_miller_loop(&refs).final_exponentiation();
-        Ok(result == Gt::identity())
+        #[cfg(not(feature = "blst"))]
+        {
+            let _ = pairs;
+            Err(CryptoError::Unsupported(BLS_UNSUPPORTED))
+        }
     }
 
     /// Map field element to G1 point.
     fn bls12_381_fp_to_g1(&self, fp: &[u8; 48]) -> Result<[u8; 96], CryptoError> {
-        use bls12_381::{Fp, G1Affine, G1Projective, hash_to_curve::MapToCurve};
-
-        let fp_elem = Fp::from_bytes(fp)
-            .into_option()
-            .ok_or(CryptoError::InvalidInput("invalid Fp element"))?;
-
-        let point = G1Projective::map_to_curve(&fp_elem).clear_h();
-        serialize_bls12_g1(&G1Affine::from(point))
+        #[cfg(feature = "blst")]
+        {
+            crate::bls_blst::fp_to_g1(fp)
+        }
+        #[cfg(not(feature = "blst"))]
+        {
+            let _ = fp;
+            Err(CryptoError::Unsupported(BLS_UNSUPPORTED))
+        }
     }
 
     /// Map field element pair to G2 point.
     fn bls12_381_fp2_to_g2(&self, fp2: ([u8; 48], [u8; 48])) -> Result<[u8; 192], CryptoError> {
-        use bls12_381::{Fp, Fp2, G2Affine, G2Projective, hash_to_curve::MapToCurve};
-
-        let c0 = Fp::from_bytes(&fp2.0)
-            .into_option()
-            .ok_or(CryptoError::InvalidInput("invalid Fp2.c0 element"))?;
-        let c1 = Fp::from_bytes(&fp2.1)
-            .into_option()
-            .ok_or(CryptoError::InvalidInput("invalid Fp2.c1 element"))?;
-
-        let fp2_elem = Fp2 { c0, c1 };
-        let point = G2Projective::map_to_curve(&fp2_elem).clear_h();
-        serialize_bls12_g2(&G2Affine::from(point))
+        #[cfg(feature = "blst")]
+        {
+            crate::bls_blst::fp2_to_g2(fp2)
+        }
+        #[cfg(not(feature = "blst"))]
+        {
+            let _ = fp2;
+            Err(CryptoError::Unsupported(BLS_UNSUPPORTED))
+        }
     }
 }
 
-// ── BLS12-381 helpers (used by trait default methods) ──────────────────────
+// ── Modexp helper ──────────────────────────────────────────────────────────
 
-/// Parse an unpadded BLS12-381 G1 point from two 48-byte field elements.
-///
-/// `Fp::from_bytes` validates that each coordinate is strictly less than the
-/// field modulus, which also prevents the top bits from being misinterpreted
-/// as BLS serialization flags.
-fn parse_bls12_g1(
-    (x_bytes, y_bytes): ([u8; 48], [u8; 48]),
-) -> Result<bls12_381::G1Affine, CryptoError> {
-    use bls12_381::{Fp, G1Affine};
-
-    let x = Fp::from_bytes(&x_bytes)
-        .into_option()
-        .ok_or(CryptoError::InvalidInput(
-            "G1 x coordinate >= field modulus",
-        ))?;
-    let y = Fp::from_bytes(&y_bytes)
-        .into_option()
-        .ok_or(CryptoError::InvalidInput(
-            "G1 y coordinate >= field modulus",
-        ))?;
-
-    if x.is_zero().into() && y.is_zero().into() {
-        return Ok(G1Affine::identity());
+/// Pad or truncate modexp result bytes to match the modulus length.
+fn pad_modexp_output(res_bytes: Vec<u8>, modulus_len: usize) -> Result<Vec<u8>, CryptoError> {
+    let mut out = vec![0u8; modulus_len];
+    if res_bytes.len() <= modulus_len {
+        let offset = modulus_len - res_bytes.len();
+        out[offset..].copy_from_slice(&res_bytes);
+    } else {
+        out.copy_from_slice(&res_bytes[res_bytes.len() - modulus_len..]);
     }
-
-    let affine = G1Affine::new_unchecked(x, y);
-
-    if !bool::from(affine.is_on_curve()) {
-        return Err(CryptoError::InvalidPoint("G1 point not on curve"));
-    }
-
-    Ok(affine)
-}
-
-/// Parse an unpadded BLS12-381 G2 point from four 48-byte field elements.
-/// EIP-2537 encodes G2 as (x_0, x_1, y_0, y_1) where x = x_0 + x_1*u in Fp2.
-fn parse_bls12_g2(
-    (x0, x1, y0, y1): ([u8; 48], [u8; 48], [u8; 48], [u8; 48]),
-) -> Result<bls12_381::G2Affine, CryptoError> {
-    use bls12_381::{Fp, Fp2, G2Affine};
-
-    let x0 = Fp::from_bytes(&x0)
-        .into_option()
-        .ok_or(CryptoError::InvalidInput("G2 x0 >= field modulus"))?;
-    let x1 = Fp::from_bytes(&x1)
-        .into_option()
-        .ok_or(CryptoError::InvalidInput("G2 x1 >= field modulus"))?;
-    let y0 = Fp::from_bytes(&y0)
-        .into_option()
-        .ok_or(CryptoError::InvalidInput("G2 y0 >= field modulus"))?;
-    let y1 = Fp::from_bytes(&y1)
-        .into_option()
-        .ok_or(CryptoError::InvalidInput("G2 y1 >= field modulus"))?;
-
-    if x0.is_zero().into() && x1.is_zero().into() && y0.is_zero().into() && y1.is_zero().into() {
-        return Ok(G2Affine::identity());
-    }
-
-    let affine = G2Affine::new_unchecked(Fp2 { c0: x0, c1: x1 }, Fp2 { c0: y0, c1: y1 });
-
-    if !bool::from(affine.is_on_curve()) {
-        return Err(CryptoError::InvalidPoint("G2 point not on curve"));
-    }
-
-    Ok(affine)
-}
-
-/// Parse a 32-byte big-endian scalar as a BLS12-381 Scalar.
-fn parse_bls12_scalar(scalar_bytes: &[u8; 32]) -> bls12_381::Scalar {
-    let scalar_le = [
-        u64::from_be_bytes(scalar_bytes[24..32].try_into().unwrap_or([0u8; 8])),
-        u64::from_be_bytes(scalar_bytes[16..24].try_into().unwrap_or([0u8; 8])),
-        u64::from_be_bytes(scalar_bytes[8..16].try_into().unwrap_or([0u8; 8])),
-        u64::from_be_bytes(scalar_bytes[0..8].try_into().unwrap_or([0u8; 8])),
-    ];
-    bls12_381::Scalar::from_raw(scalar_le)
-}
-
-/// Serialize a BLS12-381 G1Affine point to 96 unpadded bytes (x || y, each 48 bytes).
-fn serialize_bls12_g1(point: &bls12_381::G1Affine) -> Result<[u8; 96], CryptoError> {
-    if bool::from(point.is_identity()) {
-        return Ok([0u8; 96]);
-    }
-
-    let uncompressed = point.to_uncompressed();
-    Ok(uncompressed)
-}
-
-/// Serialize a BLS12-381 G2Affine point to 192 unpadded bytes.
-/// bls12_381 serializes as x_1 || x_0 || y_1 || y_0 (192 bytes).
-/// We output as x_0 || x_1 || y_0 || y_1 to match EIP-2537 convention.
-fn serialize_bls12_g2(point: &bls12_381::G2Affine) -> Result<[u8; 192], CryptoError> {
-    if bool::from(point.is_identity()) {
-        return Ok([0u8; 192]);
-    }
-
-    let raw = point.to_uncompressed();
-    let mut out = [0u8; 192];
-    out[0..48].copy_from_slice(&raw[48..96]); // x_0
-    out[48..96].copy_from_slice(&raw[0..48]); // x_1
-    out[96..144].copy_from_slice(&raw[144..192]); // y_0
-    out[144..192].copy_from_slice(&raw[96..144]); // y_1
     Ok(out)
 }
+
+// The BLS12-381 point parse/serialize helpers that backed the portable trait
+// defaults now live in `ethrex-guest-program` alongside the guest `Crypto`
+// providers, so this crate no longer depends on the `bls12_381` git fork.

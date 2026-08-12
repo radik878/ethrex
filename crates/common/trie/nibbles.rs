@@ -1,4 +1,6 @@
-use std::{cmp, mem};
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+use core::{cmp, mem};
 
 use ethrex_rlp::{
     decode::RLPDecode,
@@ -45,7 +47,7 @@ unsafe fn expand_bytes_to_nibbles(bytes: &[u8], output: *mut u8) {
 #[allow(unsafe_code)]
 #[inline]
 unsafe fn expand_bytes_to_nibbles_x86_64(bytes: &[u8], output: *mut u8) {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let n = bytes.len();
     let mut i = 0usize;
@@ -111,7 +113,7 @@ unsafe fn expand_bytes_to_nibbles_x86_64(bytes: &[u8], output: *mut u8) {
 #[allow(unsafe_code)]
 #[inline]
 unsafe fn expand_bytes_to_nibbles_aarch64(bytes: &[u8], output: *mut u8) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let n = bytes.len();
     let mut i = 0usize;
@@ -195,8 +197,6 @@ unsafe fn pack_nibble_pairs(nibbles: &[u8], output: *mut u8) {
 #[allow(unsafe_code)]
 #[inline]
 unsafe fn pack_nibble_pairs_x86_64(nibbles: &[u8], output: *mut u8) {
-    use std::arch::x86_64::*;
-
     let n = nibbles.len(); // always even
     let mut i = 0usize; // index into nibbles (steps of 32)
     let mut o = 0usize; // index into output (steps of 16)
@@ -207,6 +207,7 @@ unsafe fn pack_nibble_pairs_x86_64(nibbles: &[u8], output: *mut u8) {
     #[cfg(target_feature = "ssse3")]
     // SAFETY: SSSE3 enabled at compile time; pointer arithmetic stays within bounds.
     unsafe {
+        use core::arch::x86_64::*;
         // Multiplier: weight = [16, 1] repeated → multiply even nibble by 16, odd by 1
         let weights = _mm_set1_epi16(0x0110_u16 as i16); // bytes: [16, 1, 16, 1, ...]
         while i + 32 <= n {
@@ -240,7 +241,7 @@ unsafe fn pack_nibble_pairs_x86_64(nibbles: &[u8], output: *mut u8) {
 #[allow(unsafe_code)]
 #[inline]
 unsafe fn pack_nibble_pairs_aarch64(nibbles: &[u8], output: *mut u8) {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let n = nibbles.len();
     let mut i = 0usize;
@@ -310,7 +311,7 @@ fn count_common_prefix(a: &[u8], b: &[u8]) -> usize {
 #[allow(unsafe_code)]
 #[inline]
 unsafe fn count_common_prefix_x86_64(a: &[u8], b: &[u8]) -> usize {
-    use std::arch::x86_64::*;
+    use core::arch::x86_64::*;
 
     let n = a.len().min(b.len());
     let mut i = 0usize;
@@ -357,7 +358,7 @@ unsafe fn count_common_prefix_x86_64(a: &[u8], b: &[u8]) -> usize {
 #[allow(unsafe_code)]
 #[inline]
 unsafe fn count_common_prefix_aarch64(a: &[u8], b: &[u8]) -> usize {
-    use std::arch::aarch64::*;
+    use core::arch::aarch64::*;
 
     let n = a.len().min(b.len());
     let mut i = 0usize;
@@ -437,8 +438,8 @@ impl Ord for Nibbles {
     }
 }
 
-impl std::hash::Hash for Nibbles {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl core::hash::Hash for Nibbles {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.data.hash(state);
     }
 }
@@ -498,8 +499,8 @@ impl Nibbles {
     /// the prefix and return true, otherwise return false.
     pub fn skip_prefix(&mut self, prefix: &Nibbles) -> bool {
         if self.len() >= prefix.len() && &self.data[..prefix.len()] == prefix.as_ref() {
-            self.data = self.data[prefix.len()..].to_vec();
-            self.already_consumed.extend(&prefix.data);
+            self.already_consumed.extend_from_slice(&prefix.data);
+            self.data.drain(..prefix.len());
             true
         } else {
             false
@@ -536,9 +537,13 @@ impl Nibbles {
 
     /// Returns the nibbles after the given offset
     pub fn offset(&self, offset: usize) -> Nibbles {
-        let mut ret = self.slice(offset, self.len());
-        ret.already_consumed = [&self.already_consumed, &self.data[0..offset]].concat();
-        ret
+        let mut already_consumed = Vec::with_capacity(self.already_consumed.len() + offset);
+        already_consumed.extend_from_slice(&self.already_consumed);
+        already_consumed.extend_from_slice(&self.data[..offset]);
+        Nibbles {
+            data: self.data[offset..].to_vec(),
+            already_consumed,
+        }
     }
 
     /// Returns the nibbles beween the start and end indexes
@@ -640,16 +645,22 @@ impl Nibbles {
 
     /// Concatenates self and another Nibbles returning a new Nibbles
     pub fn concat(&self, other: &Nibbles) -> Nibbles {
+        let mut data = Vec::with_capacity(self.data.len() + other.data.len());
+        data.extend_from_slice(&self.data);
+        data.extend_from_slice(&other.data);
         Nibbles {
-            data: [&self.data[..], &other.data[..]].concat(),
+            data,
             already_consumed: self.already_consumed.clone(),
         }
     }
 
-    /// Returns a copy of self with the nibble added at the and
+    /// Returns a copy of self with the nibble added at the end
     pub fn append_new(&self, nibble: u8) -> Nibbles {
+        let mut data = Vec::with_capacity(self.data.len() + 1);
+        data.extend_from_slice(&self.data);
+        data.push(nibble);
         Nibbles {
-            data: [self.data.clone(), vec![nibble]].concat(),
+            data,
             already_consumed: self.already_consumed.clone(),
         }
     }
@@ -704,12 +715,16 @@ fn compact_to_hex(compact: &[u8]) -> Vec<u8> {
     }
     let mut base = keybytes_to_hex(compact);
     // delete terminator flag
-    if base[0] < 2 {
-        base = base[..base.len() - 1].to_vec();
-    }
+    let end = if base[0] < 2 {
+        base.len() - 1
+    } else {
+        base.len()
+    };
     // apply odd flag
     let chop = 2 - (base[0] & 1) as usize;
-    base[chop..].to_vec()
+    base.drain(..chop);
+    base.truncate(end - chop);
+    base
 }
 
 // Code taken from https://github.com/ethereum/go-ethereum/blob/a1093d98eb3260f2abf340903c2d968b2b891c11/trie/encoding.go#L96

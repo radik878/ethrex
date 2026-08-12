@@ -20,19 +20,28 @@ pub const MEMORY_EXPANSION_QUOTIENT: u64 = 512;
 // Dedicated gas limit for system calls according to EIPs 2935, 4788, 7002 and 7251
 pub const SYS_CALL_GAS_LIMIT: u64 = 30000000;
 
+// EIP-8037: system transactions
+// receive an extra state-gas reservoir of
+// `STATE_BYTES_PER_STORAGE_SET * cost_per_state_byte * SYSTEM_MAX_SSTORES_PER_CALL`
+// on top of `SYS_CALL_GAS_LIMIT`, so SSTORE-heavy system contracts (EIP-2935,
+// EIP-4788) cannot OOG on state-gas growth alone.
+pub const SYSTEM_MAX_SSTORES_PER_CALL: u64 = 16;
+
 // Transaction costs in gas
 pub const TX_BASE_COST: u64 = 21000;
+// EIP-2780 (merged EIPs#11645) — ECDSA recovery + sender account access + write.
+// At Amsterdam the flat 21000 base is decomposed into resource-based charges;
+// this is the sender-side base (recovery + sender access + write).
+pub const TX_BASE_COST_AMSTERDAM: u64 = 12000;
 
 // https://eips.ethereum.org/EIPS/eip-7825
 pub use ethrex_common::constants::POST_OSAKA_GAS_LIMIT_CAP;
-
-/// EIP-7825/EIP-8037: Maximum tx gas_limit for Prague (EIP-7825) and Amsterdam reservoir threshold.
-pub const TX_MAX_GAS_LIMIT_AMSTERDAM: u64 = 1 << 24; // 16,777,216
+pub use ethrex_common::constants::TX_MAX_GAS_LIMIT_AMSTERDAM;
 
 pub const MAX_CODE_SIZE: u64 = 0x6000;
 pub const INIT_CODE_MAX_SIZE: usize = 49152;
-// EIP-7954 (Amsterdam): increased limits
-pub const AMSTERDAM_MAX_CODE_SIZE: u64 = 0x8000;
+// EIP-7954 (Amsterdam): increase code size to 64 KiB and initcode to 128 KiB
+pub const AMSTERDAM_MAX_CODE_SIZE: u64 = 0x10000;
 #[allow(clippy::as_conversions)]
 pub const AMSTERDAM_INIT_CODE_MAX_SIZE: usize = 2 * AMSTERDAM_MAX_CODE_SIZE as usize;
 
@@ -68,7 +77,7 @@ pub const MAX_BLOB_COUNT_ELECTRA: u32 = 9;
 // Max blob count per tx (introduced by Osaka fork)
 pub const MAX_BLOB_COUNT_TX: usize = 6;
 
-pub const VALID_BLOB_PREFIXES: [u8; 2] = [0x01, 0x02];
+pub const VALID_BLOB_PREFIXES: [u8; 1] = [VERSIONED_HASH_VERSION_KZG];
 
 // Block constants
 pub const LAST_AVAILABLE_BLOCK_LIMIT: u64 = 256;

@@ -4,8 +4,8 @@ use ethrex_common::{
     evm::calculate_create_address,
     serde_utils,
     types::{
-        BlockHash, BlockHeader, BlockNumber, Log, Receipt, Transaction, TxKind, TxType,
-        bloom_from_logs,
+        BlockHash, BlockHeader, BlockNumber, FrameReceipt, Log, Receipt, Transaction, TxKind,
+        TxType, bloom_from_logs,
     },
 };
 use ethrex_crypto::NativeCrypto;
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::utils::RpcErr;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RpcReceipt {
     #[serde(flatten)]
     pub receipt: RpcReceiptInfo,
@@ -23,6 +24,32 @@ pub struct RpcReceipt {
     pub tx_info: RpcReceiptTxInfo,
     #[serde(flatten)]
     pub block_info: RpcReceiptBlockInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payer: Option<Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_receipts: Option<Vec<RpcFrameReceipt>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcFrameReceipt {
+    /// EIP-8141 frame status code: 0 = failure, 1 = success, 3 = skipped
+    /// (atomic-batch failure). Serialized as a hex-encoded byte.
+    #[serde(with = "serde_utils::u8::hex_str")]
+    pub status: u8,
+    #[serde(with = "serde_utils::u64::hex_str")]
+    pub gas_used: u64,
+    pub logs: Vec<RpcLogInfo>,
+}
+
+impl From<FrameReceipt> for RpcFrameReceipt {
+    fn from(fr: FrameReceipt) -> Self {
+        Self {
+            status: fr.status,
+            gas_used: fr.gas_used,
+            logs: fr.logs.into_iter().map(RpcLogInfo::from).collect(),
+        }
+    }
 }
 
 impl RpcReceipt {
@@ -38,11 +65,18 @@ impl RpcReceipt {
             logs.push(RpcLog::new(log, log_index, &tx_info, &block_info));
             log_index += 1;
         }
+        let payer = receipt.payer;
+        let frame_receipts = receipt
+            .frame_receipts
+            .clone()
+            .map(|frs| frs.into_iter().map(RpcFrameReceipt::from).collect());
         Self {
             receipt: receipt.into(),
             logs,
             tx_info,
             block_info,
+            payer,
+            frame_receipts,
         }
     }
 }
@@ -65,7 +99,7 @@ impl From<Receipt> for RpcReceiptInfo {
             tx_type: receipt.tx_type,
             status: receipt.succeeded,
             cumulative_gas_used: receipt.cumulative_gas_used,
-            logs_bloom: bloom_from_logs(&receipt.logs),
+            logs_bloom: bloom_from_logs(&receipt.logs, &ethrex_crypto::NativeCrypto),
         }
     }
 }
@@ -177,13 +211,12 @@ impl RpcReceiptTxInfo {
     ) -> Result<Self, RpcErr> {
         let nonce = transaction.nonce();
         let from = transaction.sender(&NativeCrypto)?;
-        let transaction_hash = transaction.hash();
-        let effective_gas_price = transaction
-            .effective_gas_price(base_fee_per_gas)
-            .ok_or(RpcErr::Internal(
-                "Could not get effective gas price from tx".into(),
-            ))?
-            .as_u64();
+        let transaction_hash = transaction.hash(&NativeCrypto);
+        let effective_gas_price =
+            u64::try_from(transaction.effective_gas_price(base_fee_per_gas).ok_or(
+                RpcErr::Internal("Could not get effective gas price from tx".into()),
+            )?)
+            .map_err(|_| RpcErr::Internal("effective gas price overflows u64".into()))?;
         let transaction_index = index;
         let (blob_gas_price, blob_gas_used) = match &transaction {
             Transaction::EIP4844Transaction(tx) => (
@@ -231,6 +264,8 @@ mod tests {
                     topics: vec![],
                     data: Bytes::from_static(b"strawberry"),
                 }],
+                payer: None,
+                frame_receipts: None,
             },
             RpcReceiptTxInfo {
                 transaction_hash: H256::zero(),
