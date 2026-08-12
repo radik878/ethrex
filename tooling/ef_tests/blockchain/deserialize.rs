@@ -89,6 +89,9 @@ where
                         "Transaction gas limit exceeds maximum.".to_string(),
                     )
                 }
+                "TransactionException.INVALID_SIGNATURE_VRS" => {
+                    BlockChainExpectedException::InvalidSignature
+                }
                 "BlockException.RLP_STRUCTURES_ENCODING" => {
                     BlockChainExpectedException::RLPException
                 }
@@ -120,6 +123,9 @@ where
                         BlockExpectedException::SystemContractCallFailed,
                     )
                 }
+                "BlockException.RLP_BLOCK_LIMIT_EXCEEDED" => BlockChainExpectedException::BlockException(
+                    BlockExpectedException::RlpBlockLimitExceeded,
+                ),
                 _ => BlockChainExpectedException::Other,
             })
             .collect();

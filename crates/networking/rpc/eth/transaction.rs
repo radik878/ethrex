@@ -4,21 +4,21 @@ use crate::{
     eth::block,
     rpc::{RpcApiContext, RpcHandler},
     types::{
-        block_identifier::BlockIdentifier,
+        block_identifier::{BlockIdentifier, BlockIdentifierOrHash},
         transaction::{RpcTransaction, SendRawTransactionRequest},
     },
     utils::RpcErr,
 };
 use ethrex_blockchain::{Blockchain, vm::StoreVmDatabase};
 use ethrex_common::{
-    H256, U256,
+    H256,
     types::{AccessListEntry, BlockHash, BlockHeader, BlockNumber, GenericTransaction, TxKind},
 };
 
 use ethrex_rlp::encode::RLPEncode;
 use ethrex_storage::Store;
 
-use ethrex_vm::ExecutionResult;
+use ethrex_vm::{ExecutionResult, backends::levm::get_max_allowed_gas_limit};
 use serde::Serialize;
 
 use serde_json::Value;
@@ -30,7 +30,7 @@ pub const TRANSACTION_GAS: u64 = 21_000; // Per transaction not creating a contr
 
 pub struct CallRequest {
     transaction: GenericTransaction,
-    block: Option<BlockIdentifier>,
+    block: Option<BlockIdentifierOrHash>,
 }
 
 pub struct GetTransactionByBlockNumberAndIndexRequest {
@@ -90,7 +90,7 @@ impl RpcHandler for CallRequest {
         }
         let block = match params.get(1) {
             // Differentiate between missing and bad block param
-            Some(value) => Some(BlockIdentifier::parse(value.clone(), 1)?),
+            Some(value) => Some(BlockIdentifierOrHash::parse(value.clone(), 1)?),
             None => None,
         };
         Ok(CallRequest {
@@ -99,7 +99,10 @@ impl RpcHandler for CallRequest {
         })
     }
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
-        let block = self.block.clone().unwrap_or_default();
+        let block = self
+            .block
+            .clone()
+            .unwrap_or(BlockIdentifierOrHash::Identifier(BlockIdentifier::default()));
         debug!("Requested call on block: {}", block);
         let header = match block.resolve_block_header(&context.storage).await? {
             Some(header) => header,
@@ -289,7 +292,7 @@ impl RpcHandler for GetTransactionReceiptRequest {
             "Requested receipt for transaction {:#x}",
             self.transaction_hash,
         );
-        let (block_number, block_hash, index) = match storage
+        let (_block_number, block_hash, index) = match storage
             .get_transaction_location(self.transaction_hash)
             .await?
         {
@@ -301,7 +304,7 @@ impl RpcHandler for GetTransactionReceiptRequest {
             None => return Ok(Value::Null),
         };
         let receipts =
-            block::get_all_block_rpc_receipts(block_number, block.header, block.body, storage)
+            block::get_all_block_rpc_receipts(block.header, block.body, storage, Some(index))
                 .await?;
 
         serde_json::to_value(receipts.get(index as usize))
@@ -346,7 +349,7 @@ impl RpcHandler for CreateAccessListRequest {
             _ => return Ok(Value::Null),
         };
 
-        let vm_db = StoreVmDatabase::new(context.storage.clone(), header.hash());
+        let vm_db = StoreVmDatabase::new(context.storage.clone(), header.clone())?;
         let mut vm = context.blockchain.new_evm(vm_db)?;
 
         // Run transaction and obtain access list
@@ -437,12 +440,16 @@ impl RpcHandler for EstimateGasRequest {
         let storage = &context.storage;
         let blockchain = &context.blockchain;
         let block = self.block.clone().unwrap_or_default();
+        let chain_config = storage.get_chain_config();
+
         debug!("Requested estimate on block: {}", block);
         let block_header = match block.resolve_block_header(storage).await? {
             Some(header) => header,
             // Block not found
             _ => return Ok(Value::Null),
         };
+
+        let current_fork = chain_config.fork(block_header.timestamp);
 
         let transaction = match self.transaction.nonce {
             Some(_nonce) => self.transaction.clone(),
@@ -480,12 +487,13 @@ impl RpcHandler for EstimateGasRequest {
         }
 
         // Prepare binary search
+        let highest_gas_limit = get_max_allowed_gas_limit(block_header.gas_limit, current_fork);
         let mut highest_gas_limit = match transaction.gas {
-            Some(gas) => gas.min(block_header.gas_limit),
-            None => block_header.gas_limit,
+            Some(gas) => gas.min(highest_gas_limit),
+            None => highest_gas_limit,
         };
 
-        if transaction.gas_price != 0 {
+        if !transaction.gas_price.is_zero() {
             highest_gas_limit = recap_with_account_balances(
                 highest_gas_limit,
                 &transaction,
@@ -556,9 +564,10 @@ async fn recap_with_account_balances(
         .await?
         .map(|acc| acc.balance)
         .unwrap_or_default();
-    let account_gas =
-        account_balance.saturating_sub(transaction.value) / U256::from(transaction.gas_price);
-    Ok(highest_gas_limit.min(account_gas.as_u64()))
+    let account_gas = account_balance.saturating_sub(transaction.value) / transaction.gas_price;
+    // If account_gas exceeds u64, the account can afford any gas limit.
+    let account_gas = u64::try_from(account_gas).unwrap_or(highest_gas_limit);
+    Ok(highest_gas_limit.min(account_gas))
 }
 
 fn simulate_tx(
@@ -567,7 +576,7 @@ fn simulate_tx(
     storage: Store,
     blockchain: Arc<Blockchain>,
 ) -> Result<ExecutionResult, RpcErr> {
-    let vm_db = StoreVmDatabase::new(storage.clone(), block_header.hash());
+    let vm_db = StoreVmDatabase::new(storage, block_header.clone())?;
     let mut vm = blockchain.new_evm(vm_db)?;
 
     match vm.simulate_tx_from_generic(transaction, block_header)? {
@@ -597,10 +606,14 @@ impl RpcHandler for SendRawTransactionRequest {
     }
 
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
+        // RPC submissions go through the *local* entry points so the
+        // BlockchainOptions::private_mempool flag controls whether the tx is
+        // propagated to peers. P2P-received txs continue to use the
+        // non-local methods elsewhere.
         let hash = if let SendRawTransactionRequest::EIP4844(wrapped_blob_tx) = self {
             context
                 .blockchain
-                .add_blob_transaction_to_pool(
+                .add_local_blob_transaction_to_pool(
                     wrapped_blob_tx.tx.clone(),
                     wrapped_blob_tx.blobs_bundle.clone(),
                 )
@@ -608,7 +621,7 @@ impl RpcHandler for SendRawTransactionRequest {
         } else {
             context
                 .blockchain
-                .add_transaction_to_pool(self.to_transaction())
+                .add_local_transaction_to_pool(self.to_transaction())
                 .await
         }?;
         serde_json::to_value(format!("{hash:#x}"))
@@ -632,4 +645,79 @@ fn get_transaction_data(rpc_req_params: &Option<Vec<Value>>) -> Result<Vec<u8>, 
         .strip_prefix("0x")
         .ok_or(RpcErr::BadParams("Params are note 0x prefixed".to_owned()))?;
     hex::decode(str_data).map_err(|error| RpcErr::BadParams(error.to_string()))
+}
+
+#[cfg(test)]
+mod call_nonce_tests {
+    use std::str::FromStr;
+
+    use crate::rpc::map_http_requests;
+    use crate::test_utils::default_context_with_storage;
+    use crate::utils::RpcRequest;
+    use ethrex_common::Address;
+    use ethrex_common::types::Genesis;
+    use ethrex_storage::{EngineType, Store};
+    use serde_json::{Value, json};
+
+    /// Funded EOA from fixtures/genesis/l1.json.
+    const SENDER: &str = "0x00000a8d3f37af8def18832962ee008d8dca4f7b";
+
+    /// In-memory store from the l1 test genesis with `SENDER`'s account nonce
+    /// bumped, so call objects can be exercised against a sender whose
+    /// on-chain nonce is nonzero.
+    async fn setup_store_with_sender_nonce(nonce: u64) -> Store {
+        let genesis: &str = include_str!("../../../../fixtures/genesis/l1.json");
+        let mut genesis: Genesis =
+            serde_json::from_str(genesis).expect("Fatal: test config is invalid");
+        genesis
+            .alloc
+            .get_mut(&Address::from_str(SENDER).unwrap())
+            .expect("test sender missing from genesis")
+            .nonce = nonce;
+        let mut store =
+            Store::new("test-store", EngineType::InMemory).expect("Fail to create in-memory db");
+        store.add_initial_state(genesis).await.unwrap();
+        store
+    }
+
+    async fn run_eth_call(call_object: Value) -> Value {
+        let storage = setup_store_with_sender_nonce(5).await;
+        let context = default_context_with_storage(storage).await;
+        let request: RpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [call_object, "latest"],
+        }))
+        .unwrap();
+        map_http_requests(&request, context).await.unwrap()
+    }
+
+    /// A call object without `nonce` must not be rejected for senders whose
+    /// account nonce is nonzero: the env defaults the tx nonce to 0, which the
+    /// hook used to enforce against the state nonce.
+    #[tokio::test]
+    async fn eth_call_ignores_missing_nonce() {
+        let result = run_eth_call(json!({
+            "from": SENDER,
+            "to": "0xc100000000000000000000000000000000000000",
+            "value": "0x1",
+        }))
+        .await;
+        assert_eq!(result, Value::String("0x".to_string()));
+    }
+
+    /// An explicit stale nonce is ignored too: no client validates the sender
+    /// nonce on eth_call, even when the call object supplies one.
+    #[tokio::test]
+    async fn eth_call_ignores_explicit_stale_nonce() {
+        let result = run_eth_call(json!({
+            "from": SENDER,
+            "to": "0xc100000000000000000000000000000000000000",
+            "value": "0x1",
+            "nonce": "0x0",
+        }))
+        .await;
+        assert_eq!(result, Value::String("0x".to_string()));
+    }
 }

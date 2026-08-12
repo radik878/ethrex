@@ -1,77 +1,8 @@
-use bytes::Bytes;
-use ethrex_common::{
-    serde_utils,
-    types::{
-        ChainConfig,
-        block_execution_witness::{ExecutionWitness, GuestProgramStateError},
-    },
-};
-use serde::{Deserialize, Serialize};
+use ethrex_common::types::block_execution_witness::RpcExecutionWitness;
 use serde_json::Value;
 use tracing::debug;
 
 use crate::{RpcApiContext, RpcErr, RpcHandler, types::block_identifier::BlockIdentifier};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RpcExecutionWitness {
-    #[serde(
-        serialize_with = "serde_utils::bytes::vec::serialize",
-        deserialize_with = "serde_utils::bytes::vec::deserialize"
-    )]
-    pub state: Vec<Bytes>,
-    #[serde(
-        serialize_with = "serde_utils::bytes::vec::serialize",
-        deserialize_with = "serde_utils::bytes::vec::deserialize"
-    )]
-    pub keys: Vec<Bytes>,
-    #[serde(
-        serialize_with = "serde_utils::bytes::vec::serialize",
-        deserialize_with = "serde_utils::bytes::vec::deserialize"
-    )]
-    pub codes: Vec<Bytes>,
-    #[serde(
-        serialize_with = "serde_utils::bytes::vec::serialize",
-        deserialize_with = "serde_utils::bytes::vec::deserialize"
-    )]
-    pub headers: Vec<Bytes>,
-}
-
-impl From<ExecutionWitness> for RpcExecutionWitness {
-    fn from(value: ExecutionWitness) -> Self {
-        Self {
-            state: value.nodes.into_iter().map(Bytes::from).collect(),
-            keys: value.keys.into_iter().map(Bytes::from).collect(),
-            codes: value.codes.into_iter().map(Bytes::from).collect(),
-            headers: value
-                .block_headers_bytes
-                .into_iter()
-                .map(Bytes::from)
-                .collect(),
-        }
-    }
-}
-
-// TODO: Ideally this would be a try_from but crate dependencies complicate this matter
-pub fn execution_witness_from_rpc_chain_config(
-    rpc_witness: RpcExecutionWitness,
-    chain_config: ChainConfig,
-    first_block_number: u64,
-) -> Result<ExecutionWitness, GuestProgramStateError> {
-    let witness = ExecutionWitness {
-        codes: rpc_witness.codes.into_iter().map(|b| b.to_vec()).collect(),
-        chain_config,
-        first_block_number,
-        block_headers_bytes: rpc_witness
-            .headers
-            .into_iter()
-            .map(|b| b.to_vec())
-            .collect(),
-        nodes: rpc_witness.state.into_iter().map(|b| b.to_vec()).collect(),
-        keys: rpc_witness.keys.into_iter().map(|b| b.to_vec()).collect(),
-    };
-
-    Ok(witness)
-}
 
 pub struct ExecutionWitnessRequest {
     pub from: BlockIdentifier,
@@ -133,19 +64,11 @@ impl RpcHandler for ExecutionWitnessRequest {
         }
 
         let mut blocks = Vec::new();
-        let mut block_headers = Vec::new();
         for block_number in from_block_number..=to_block_number {
             let header = context
                 .storage
                 .get_block_header(block_number)?
                 .ok_or(RpcErr::Internal("Could not get block header".to_string()))?;
-            let parent_header = context
-                .storage
-                .get_block_header_by_hash(header.parent_hash)?
-                .ok_or(RpcErr::Internal(
-                    "Could not get parent block header".to_string(),
-                ))?;
-            block_headers.push(parent_header);
             let block = context
                 .storage
                 .get_block_by_hash(header.hash())
@@ -154,13 +77,28 @@ impl RpcHandler for ExecutionWitnessRequest {
             blocks.push(block);
         }
 
+        if blocks.len() == 1 {
+            // Check if we have a cached witness for this block
+            // Use raw JSON bytes path to avoid deserialization + re-serialization
+            let block = &blocks[0];
+            if let Some(json_bytes) = context
+                .storage
+                .get_witness_json_bytes(block.header.number, block.hash())?
+            {
+                // Parse directly to Value - witness is already in RPC format
+                return serde_json::from_slice(&json_bytes)
+                    .map_err(|e| RpcErr::Internal(format!("Failed to parse cached witness: {e}")));
+            }
+        }
+
         let execution_witness = context
             .blockchain
             .generate_witness_for_blocks(&blocks)
             .await
             .map_err(|e| RpcErr::Internal(format!("Failed to build execution witness {e}")))?;
 
-        let rpc_execution_witness = RpcExecutionWitness::from(execution_witness);
+        let rpc_execution_witness = RpcExecutionWitness::try_from(execution_witness)
+            .map_err(|e| RpcErr::Internal(format!("Failed to create rpc execution witness {e}")))?;
 
         serde_json::to_value(rpc_execution_witness)
             .map_err(|error| RpcErr::Internal(error.to_string()))

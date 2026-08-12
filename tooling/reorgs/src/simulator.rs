@@ -17,6 +17,7 @@ use ethrex_common::{
 };
 use ethrex_config::networks::Network;
 use ethrex_l2_rpc::signer::{Signable, Signer};
+use ethrex_p2p::snap::constants::PEER_REPLY_TIMEOUT;
 use ethrex_p2p::sync::SyncMode;
 use ethrex_rpc::{
     EngineClient, EthClient,
@@ -32,6 +33,7 @@ use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use url::Url;
 
 pub struct Simulator {
     cmd_path: PathBuf,
@@ -42,7 +44,7 @@ pub struct Simulator {
     genesis_path: PathBuf,
     configs: Vec<Options>,
     enodes: Vec<String>,
-    cancellation_tokens: Vec<CancellationToken>,
+    cancellation_tokens: Vec<(CancellationToken, tokio::task::JoinHandle<()>)>,
 }
 
 impl Simulator {
@@ -51,7 +53,7 @@ impl Simulator {
         let jwt_secret = generate_jwt_secret();
         std::fs::write("jwt.hex", hex::encode(&jwt_secret)).unwrap();
 
-        let genesis_path = std::path::absolute("../../fixtures/genesis/l1-dev.json")
+        let genesis_path = std::path::absolute("../../fixtures/genesis/l1.json")
             .unwrap()
             .canonicalize()
             .unwrap();
@@ -96,7 +98,10 @@ impl Simulator {
 
         opts.syncmode = SyncMode::Full;
 
-        let _ = std::fs::remove_dir_all(&opts.datadir);
+        if opts.datadir.exists() {
+            std::fs::remove_dir_all(&opts.datadir)
+                .expect("Failed to remove existing data directory");
+        }
         std::fs::create_dir_all(&opts.datadir).expect("Failed to create data directory");
 
         let now = SystemTime::now()
@@ -109,7 +114,6 @@ impl Simulator {
         let cancel = CancellationToken::new();
 
         self.configs.push(opts.clone());
-        self.cancellation_tokens.push(cancel.clone());
 
         let mut cmd = Command::new(&self.cmd_path);
         cmd.args([
@@ -123,6 +127,7 @@ impl Simulator {
             format!("--network={}", self.genesis_path.display()),
             format!("--syncmode={:?}", opts.syncmode).to_lowercase(),
             "--force".to_string(),
+            "--mempool.min-tip=0".to_string(),
         ])
         .stdin(Stdio::null())
         .stdout(logs_file.try_clone().unwrap())
@@ -141,20 +146,26 @@ impl Simulator {
                 .expect("node initialization timed out");
         self.enodes.push(enode);
 
-        tokio::spawn(async move {
-            let mut child = child;
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    if let Some(pid) = child.id() {
-                        // NOTE: we use SIGTERM instead of child.kill() so sockets are closed
-                        signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM).unwrap();
+        let waiter = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let mut child = child;
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        if let Some(pid) = child.id() {
+                            // NOTE: we use SIGTERM instead of child.kill() so sockets are closed
+                            signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM).unwrap();
+                        }
+                    }
+                    res = child.wait() => {
+                        assert!(res.unwrap().success());
                     }
                 }
-                res = child.wait() => {
-                    assert!(res.unwrap().success());
-                }
+                // Ignore any errors on shutdown
+                let _ = child.wait().await.unwrap();
             }
         });
+        self.cancellation_tokens.push((cancel, waiter));
 
         info!(
             "Started node {n} at http://{}:{}",
@@ -164,15 +175,19 @@ impl Simulator {
         self.get_node(n)
     }
 
-    pub fn stop(&self) {
-        for token in &self.cancellation_tokens {
+    pub async fn stop(&mut self) {
+        for (token, waiter) in self.cancellation_tokens.drain(..) {
             token.cancel();
+            waiter.await.unwrap();
         }
+        self.enodes.clear();
+        self.configs.clear();
     }
 
-    fn get_http_url(&self, index: usize) -> String {
+    fn get_http_url(&self, index: usize) -> Url {
         let opts = &self.configs[index];
-        format!("http://{}:{}", opts.http_addr, opts.http_port)
+        Url::parse(&format!("http://{}:{}", opts.http_addr, opts.http_port))
+            .expect("Error parsing RPC URL")
     }
 
     fn get_auth_url(&self, index: usize) -> String {
@@ -185,7 +200,7 @@ impl Simulator {
         let engine_client = EngineClient::new(&auth_url, self.jwt_secret.clone());
 
         let http_url = self.get_http_url(index);
-        let rpc_client = EthClient::new(&http_url).unwrap();
+        let rpc_client = EthClient::new(http_url).unwrap();
 
         Node {
             index,
@@ -198,7 +213,7 @@ impl Simulator {
 /// Waits until the node is initialized by reading its logs.
 /// Returns the enode URL of the node.
 async fn wait_for_initialization(mut logs_file: File) -> String {
-    const NODE_STARTED_LOG: &str = "Starting Auth-RPC server at";
+    const NODE_STARTED_LOG: &str = "Auth-RPC server listening on";
 
     let mut file_contents = String::new();
 
@@ -238,12 +253,19 @@ impl Node {
         );
         let syncing_fut = wait_until_synced(&self.engine_client, fork_choice_state);
 
-        tokio::time::timeout(Duration::from_secs(5), syncing_fut)
-            .await
-            .inspect_err(|_| {
-                error!(node = self.index, "Timed out waiting for node to sync");
-            })
-            .expect("timed out waiting for node to sync");
+        // Needs to be at least 2x the p2p peer reply timeout so that if the
+        // node queries the wrong peer first (e.g. one with a different chain),
+        // it has time to retry with the correct peer. Extra 10s of slack for
+        // slow CI environments.
+        tokio::time::timeout(
+            PEER_REPLY_TIMEOUT * 2 + Duration::from_secs(10),
+            syncing_fut,
+        )
+        .await
+        .inspect_err(|_| {
+            error!(node = self.index, "Timed out waiting for node to sync");
+        })
+        .expect("timed out waiting for node to sync");
     }
 
     pub async fn build_payload(&self, mut chain: Chain) -> Chain {
@@ -277,14 +299,23 @@ impl Node {
 
         let payload_response = self
             .engine_client
-            .engine_get_payload_v4(payload_id)
+            .engine_get_payload_v5(payload_id)
             .await
             .unwrap();
 
         let requests_hash = compute_requests_hash(&payload_response.execution_requests.unwrap());
+        let block_access_list_hash = payload_response
+            .execution_payload
+            .block_access_list
+            .as_ref()
+            .map(|bal| bal.compute_hash(&ethrex_common::NativeCrypto));
         let block = payload_response
             .execution_payload
-            .into_block(parent_beacon_block_root, Some(requests_hash))
+            .into_block(
+                parent_beacon_block_root,
+                Some(requests_hash),
+                block_access_list_hash,
+            )
             .unwrap();
 
         info!(
@@ -307,9 +338,24 @@ impl Node {
         chain
     }
 
+    /// Submits a single, externally-built block via `engine_newPayload` without
+    /// touching `Chain` bookkeeping. Use when a test needs to feed blocks built
+    /// on another node into this node ; for the common "build then notify on
+    /// the same node" flow, prefer [`Self::notify_new_payload`].
+    pub async fn submit_block(&self, block: &Block) {
+        let execution_payload = ExecutionPayload::from_block(block.clone(), None);
+        let commitments = vec![];
+        let parent_beacon_block_root = block.header.parent_beacon_block_root.unwrap();
+        let _payload_status = self
+            .engine_client
+            .engine_new_payload_v4(execution_payload, commitments, parent_beacon_block_root)
+            .await
+            .unwrap();
+    }
+
     pub async fn notify_new_payload(&self, chain: &Chain) {
         let head = chain.blocks.last().unwrap();
-        let execution_payload = ExecutionPayload::from_block(head.clone());
+        let execution_payload = ExecutionPayload::from_block(head.clone(), None);
         // Support blobs
         // let commitments = execution_payload_response
         //     .blobs_bundle
@@ -325,11 +371,19 @@ impl Node {
         //     .collect();
         let commitments = vec![];
         let parent_beacon_block_root = head.header.parent_beacon_block_root.unwrap();
-        let _payload_status = self
-            .engine_client
-            .engine_new_payload_v4(execution_payload, commitments, parent_beacon_block_root)
-            .await
-            .unwrap();
+        // Amsterdam+ payloads carry a Block Access List and MUST use newPayloadV5;
+        // earlier forks use V4, which rejects the BAL field.
+        let _payload_status = if execution_payload.block_access_list.is_some() {
+            self.engine_client
+                .engine_new_payload_v5(execution_payload, commitments, parent_beacon_block_root)
+                .await
+                .unwrap()
+        } else {
+            self.engine_client
+                .engine_new_payload_v4(execution_payload, commitments, parent_beacon_block_root)
+                .await
+                .unwrap()
+        };
     }
 
     pub async fn send_eth_transfer(&self, signer: &Signer, recipient: H160, amount: u64) {
@@ -344,7 +398,7 @@ impl Node {
         let sender_address = signer.address();
         let nonce = self
             .rpc_client
-            .get_nonce(sender_address, BlockIdentifier::Tag(BlockTag::Latest))
+            .get_nonce(sender_address, BlockIdentifier::Tag(BlockTag::Pending))
             .await
             .unwrap();
         let tx = EIP1559Transaction {
@@ -378,7 +432,7 @@ impl Node {
         let sender_address = signer.address();
         let nonce = self
             .rpc_client
-            .get_nonce(sender_address, BlockIdentifier::Tag(BlockTag::Latest))
+            .get_nonce(sender_address, BlockIdentifier::Tag(BlockTag::Pending))
             .await
             .unwrap();
         let tx = EIP1559Transaction {
@@ -416,7 +470,7 @@ impl Node {
         let sender_address = signer.address();
         let nonce = self
             .rpc_client
-            .get_nonce(sender_address, BlockIdentifier::Tag(BlockTag::Latest))
+            .get_nonce(sender_address, BlockIdentifier::Tag(BlockTag::Pending))
             .await
             .unwrap();
         let tx = EIP1559Transaction {
@@ -460,6 +514,23 @@ pub struct Chain {
     block_hashes: Vec<H256>,
     blocks: Vec<Block>,
     safe_height: usize,
+    /// Per-chain salt mixed into [`get_next_payload_attributes`] so two `Chain`s
+    /// forked from the same parent produce divergent blocks.
+    ///
+    /// Without a salt, `get_next_payload_attributes` derives `prev_randao` and
+    /// `parent_beacon_block_root` deterministically from the parent hash, so
+    /// `let chain_a = base.fork(); let chain_b = base.fork();` followed by
+    /// independent extensions yields BYTE-IDENTICAL blocks on both chains.
+    /// FCU-ing the second chain then collides with the first chain's headers
+    /// in storage, `engine_newPayload` short-circuits on header-already-known,
+    /// the layer cache is never repopulated after the deep-reorg overlay
+    /// install, and every subsequent FCU loops back through `reorg_apply_deep`
+    /// until the test panics on `Syncing`.
+    ///
+    /// Tests that need two genuinely competing forks (e.g. `deep_reorg_beyond_128`)
+    /// must set distinct salts via [`Self::with_salt`] AFTER `fork()`. Tests that
+    /// only extend a single line keep the default of 0 ; their behavior is unchanged.
+    salt: u8,
 }
 
 impl Chain {
@@ -469,6 +540,7 @@ impl Chain {
             block_hashes: vec![genesis_block.hash()],
             blocks: vec![genesis_block],
             safe_height: 0,
+            salt: 0,
         }
     }
 
@@ -477,12 +549,45 @@ impl Chain {
         self.blocks.push(block);
     }
 
+    /// Slice of blocks from `start` (inclusive) to the chain tip. Used by
+    /// multi-node tests that need to replay divergent blocks built on one
+    /// node into another node via [`Node::submit_block`].
+    pub fn blocks_from(&self, start: usize) -> &[Block] {
+        &self.blocks[start..]
+    }
+
     pub fn fork(&self) -> Self {
         Self {
             block_hashes: self.block_hashes.clone(),
             blocks: self.blocks.clone(),
             safe_height: self.safe_height,
+            salt: self.salt,
         }
+    }
+
+    /// Returns this chain with its salt replaced, so subsequent `build_payload`
+    /// calls produce blocks that diverge from any other `Chain` sharing the same
+    /// prefix but a different salt. See the `salt` field doc for the rationale.
+    pub fn with_salt(mut self, salt: u8) -> Self {
+        self.salt = salt;
+        self
+    }
+
+    /// Mark the block at `height` as finalized (safe).
+    /// `height` is the block index in this chain (0 = genesis).
+    #[allow(dead_code)]
+    pub fn set_finalized_height(&mut self, height: usize) {
+        assert!(
+            height < self.block_hashes.len(),
+            "finalized height {height} out of range (chain has {} blocks)",
+            self.block_hashes.len()
+        );
+        self.safe_height = height;
+    }
+
+    /// Number of blocks in this chain (including genesis).
+    pub fn len(&self) -> usize {
+        self.blocks.len()
     }
 
     fn get_fork_choice_state(&self) -> ForkChoiceState {
@@ -498,8 +603,13 @@ impl Chain {
     fn get_next_payload_attributes(&self) -> PayloadAttributesV3 {
         let timestamp = self.blocks.last().unwrap().header.timestamp + 12;
         let head_hash = self.get_fork_choice_state().head_block_hash;
-        // Generate dummy values by hashing multiple times
-        let parent_beacon_block_root = keccak256(&head_hash.0);
+        // Mix the per-chain salt into the seed so sibling chains forked from the
+        // same parent produce distinct `prev_randao` / `parent_beacon_block_root`
+        // values, and therefore distinct block hashes from block 1 onward.
+        let mut seed = [0u8; 33];
+        seed[..32].copy_from_slice(&head_hash.0);
+        seed[32] = self.salt;
+        let parent_beacon_block_root = keccak256(&seed);
         let prev_randao = keccak256(&parent_beacon_block_root.0);
         let suggested_fee_recipient = Default::default();
         // TODO: add withdrawals
@@ -523,13 +633,8 @@ fn generate_jwt_secret() -> Bytes {
 }
 
 fn keccak256(data: &[u8]) -> H256 {
-    H256(
-        Sha256::new_with_prefix(data)
-            .finalize()
-            .as_slice()
-            .try_into()
-            .unwrap(),
-    )
+    let digest = Sha256::new_with_prefix(data).finalize();
+    H256::from_slice(digest.as_ref())
 }
 
 async fn wait_until_synced(engine_client: &EngineClient, fork_choice_state: ForkChoiceState) {

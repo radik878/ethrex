@@ -1,13 +1,15 @@
 use crate::{
     call_frame::CallFrame,
-    constants::{WORD_SIZE, WORD_SIZE_IN_BYTES_U64},
+    constants::{TX_BASE_COST, TX_BASE_COST_AMSTERDAM, WORD_SIZE, WORD_SIZE_IN_BYTES_U64},
     errors::{ExceptionalHalt, InternalError, PrecompileError, VMError},
     memory,
 };
 use ExceptionalHalt::OutOfGas;
-use bytes::Bytes;
 /// Contains the gas costs of the EVM instructions
-use ethrex_common::{U256, types::Fork};
+use ethrex_common::{
+    Address, U256,
+    types::{Fork, TxKind, tx_fields::AccessList},
+};
 use malachite::base::num::logic::traits::*;
 use malachite::{Natural, base::num::basic::traits::Zero as _};
 
@@ -62,6 +64,28 @@ pub const SELFBALANCE: u64 = 5;
 pub const BASEFEE: u64 = 2;
 pub const BLOBHASH: u64 = 3;
 pub const BLOBBASEFEE: u64 = 2;
+pub const SLOTNUM: u64 = 2;
+// EIP-8141 Frame Transaction opcodes
+pub const TXPARAM: u64 = 2;
+pub const FRAMEDATALOAD: u64 = 3;
+pub const FRAMEDATACOPY_STATIC: u64 = 3;
+pub const FRAMEDATACOPY_DYNAMIC_BASE: u64 = 3;
+pub const FRAMEPARAM: u64 = 2;
+pub const SIGPARAM: u64 = 2;
+
+pub fn framedatacopy(
+    new_memory_size: usize,
+    current_memory_size: usize,
+    size: usize,
+) -> Result<u64, VMError> {
+    copy_behavior(
+        new_memory_size,
+        current_memory_size,
+        size,
+        FRAMEDATACOPY_DYNAMIC_BASE,
+        FRAMEDATACOPY_STATIC,
+    )
+}
 pub const POP: u64 = 2;
 pub const MLOAD_STATIC: u64 = 3;
 pub const MSTORE_STATIC: u64 = 3;
@@ -80,6 +104,7 @@ pub const PUSH0: u64 = 2;
 pub const PUSHN: u64 = 3;
 pub const DUPN: u64 = 3;
 pub const SWAPN: u64 = 3;
+pub const EXCHANGE: u64 = 3;
 pub const LOGN_STATIC: u64 = 375;
 pub const LOGN_DYNAMIC_BASE: u64 = 375;
 pub const LOGN_DYNAMIC_BYTE_BASE: u64 = 8;
@@ -159,6 +184,20 @@ pub const INIT_CODE_WORD_COST: u64 = 2;
 pub const CODE_DEPOSIT_COST: u64 = 200;
 pub const CREATE_BASE_COST: u64 = 32000;
 
+// EIP-8037: Multidimensional gas for state creation (Amsterdam only)
+pub const STATE_BYTES_PER_NEW_ACCOUNT: u64 = 120;
+pub const STATE_BYTES_PER_STORAGE_SET: u64 = 64;
+pub const STATE_BYTES_PER_AUTH_BASE: u64 = 23; // 23-byte delegation indicator slot
+
+/// EIP-8037 cost_per_state_byte. Pinned to the fixed value 1530.
+/// The dynamic formula derived from the block gas limit
+/// is not active.
+pub fn cost_per_state_byte(_block_gas_limit: u64) -> u64 {
+    1530
+}
+
+pub const CODE_DEPOSIT_REGULAR_COST_PER_WORD: u64 = 6; // keccak hash cost per 32-byte word
+
 // Calldata costs
 pub const CALLDATA_COST_ZERO_BYTE: u64 = 4;
 pub const CALLDATA_COST_NON_ZERO_BYTE: u64 = 16;
@@ -170,6 +209,133 @@ pub const BLOB_GAS_PER_BLOB: u64 = 131072;
 // Access lists costs
 pub const ACCESS_LIST_STORAGE_KEY_COST: u64 = 1900;
 pub const ACCESS_LIST_ADDRESS_COST: u64 = 2400;
+
+// ===== EIP-8038 Amsterdam values (merged EIPs#11802) =====
+pub const COLD_ACCOUNT_ACCESS_AMSTERDAM: u64 = 3000;
+pub const COLD_STORAGE_ACCESS_AMSTERDAM: u64 = 3000;
+pub const ACCESS_LIST_ADDRESS_COST_AMSTERDAM: u64 = 3000;
+pub const ACCESS_LIST_STORAGE_KEY_COST_AMSTERDAM: u64 = 3000;
+pub const STORAGE_WRITE_AMSTERDAM: u64 = 10000;
+pub const ACCOUNT_WRITE_AMSTERDAM: u64 = 8000;
+pub const CALL_VALUE_AMSTERDAM: u64 = 10300;
+pub const STORAGE_CLEAR_REFUND_AMSTERDAM: i64 = 12480;
+pub const CREATE_ACCESS_AMSTERDAM: u64 = 11000;
+
+// ===== EIP-2780 Amsterdam values (merged EIPs#11645) =====
+// Resource-based intrinsic transaction gas. The flat 21000 base is decomposed
+// into: sender base (TX_BASE_COST_AMSTERDAM = 12000), recipient access, and a
+// value-transfer charge split between a transfer log cost and a value cost.
+pub const TX_VALUE_COST_AMSTERDAM: u64 = 4244;
+pub const TRANSFER_LOG_COST_AMSTERDAM: u64 = 1756;
+
+// EIP-8038: size in bytes of one RLP-encoded authorization tuple, used to
+// derive its calldata-floor contribution below.
+pub const AUTH_TUPLE_BYTES_AMSTERDAM: u64 = 101;
+
+// EIP-8038: regular cost per EIP-7702 authorization, in addition to ACCOUNT_WRITE.
+// This is EELS `REGULAR_PER_AUTH_BASE_COST`: the fixed *regular*-gas charge levied
+// per authorization tuple, independent of the (separate) state-gas charge for a
+// newly-materialized authority account.
+// AUTH_TUPLE_BYTES_AMSTERDAM * 16 (calldata floor) + ECRECOVER (3000)
+//   + COLD_ACCOUNT_ACCESS (3000) + 2*WARM (2*100) = 101*16 + 3000 + 3000 + 200 = 7816.
+pub const PER_AUTH_BASE_COST_AMSTERDAM: u64 = 7816;
+
+/// Transaction base cost (sender-side). EIP-2780 lowers the flat 21000 base to
+/// 12000 at Amsterdam (ECDSA recovery + sender account access + write); the
+/// remaining cost is recovered via resource-based recipient/value charges.
+pub fn tx_base_cost(fork: Fork) -> u64 {
+    if fork >= Fork::Amsterdam {
+        TX_BASE_COST_AMSTERDAM
+    } else {
+        TX_BASE_COST
+    }
+}
+
+/// Cold account access cost. EIP-8038 raises this from 2600 to 3000 at Amsterdam.
+pub fn cold_account_access_cost(fork: Fork) -> u64 {
+    if fork >= Fork::Amsterdam {
+        COLD_ACCOUNT_ACCESS_AMSTERDAM
+    } else {
+        COLD_ADDRESS_ACCESS_COST
+    }
+}
+
+/// Cold storage slot access cost. EIP-8038 raises this from 2100 to 3000 at Amsterdam.
+pub fn cold_storage_access_cost(fork: Fork) -> u64 {
+    if fork >= Fork::Amsterdam {
+        COLD_STORAGE_ACCESS_AMSTERDAM
+    } else {
+        SLOAD_COLD_DYNAMIC
+    }
+}
+
+/// Per-address access-list cost. EIP-8038 raises this from 2400 to 3000 at Amsterdam.
+pub fn access_list_address_cost(fork: Fork) -> u64 {
+    if fork >= Fork::Amsterdam {
+        ACCESS_LIST_ADDRESS_COST_AMSTERDAM
+    } else {
+        ACCESS_LIST_ADDRESS_COST
+    }
+}
+
+/// Per-storage-key access-list cost. EIP-8038 raises this from 1900 to 3000 at Amsterdam.
+pub fn access_list_storage_key_cost(fork: Fork) -> u64 {
+    if fork >= Fork::Amsterdam {
+        ACCESS_LIST_STORAGE_KEY_COST_AMSTERDAM
+    } else {
+        ACCESS_LIST_STORAGE_KEY_COST
+    }
+}
+
+/// Upfront positive-value cost for CALL / CALLCODE. EIP-8038 raises this from
+/// 9000 to 10300 (`CALL_VALUE_AMSTERDAM`) at Amsterdam. This is the charge
+/// applied to the *caller* before the call; it is NOT the 2300 stipend
+/// (`CALL_POSITIVE_VALUE_STIPEND`) forwarded to the callee, which is unchanged.
+pub fn call_positive_value_cost(fork: Fork) -> u64 {
+    if fork >= Fork::Amsterdam {
+        CALL_VALUE_AMSTERDAM
+    } else {
+        CALL_POSITIVE_VALUE
+    }
+}
+
+/// Regular-gas contribution of the `tx.to` / `tx.value` charges (EIP-2780,
+/// items 2-3 of EELS `calculate_intrinsic_cost`). Returns 0 pre-Amsterdam.
+/// Excludes the sender-side base cost (`tx_base_cost`) and the EIP-3860
+/// init-code-word cost — both are applied separately by callers. Shared by
+/// `VM::get_intrinsic_gas`, `intrinsic_gas_dimensions`, and the calldata-floor
+/// anchor so all three stay in lock-step.
+pub fn recipient_regular_gas(to: &TxKind, value: U256, sender: Address, fork: Fork) -> u64 {
+    if fork < Fork::Amsterdam {
+        return 0;
+    }
+
+    let is_self_transfer = matches!(to, TxKind::Call(addr) if *addr == sender);
+    if is_self_transfer {
+        return 0;
+    }
+
+    let is_create = matches!(to, TxKind::Create);
+    let regular_gas = if is_create {
+        CREATE_ACCESS_AMSTERDAM
+    } else {
+        cold_account_access_cost(fork)
+    };
+
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "sum of small constant gas costs (<= ~17000), cannot overflow u64"
+    )]
+    if !value.is_zero() {
+        if is_create {
+            regular_gas + TRANSFER_LOG_COST_AMSTERDAM
+        } else {
+            regular_gas + TRANSFER_LOG_COST_AMSTERDAM + TX_VALUE_COST_AMSTERDAM
+        }
+    } else {
+        regular_gas
+    }
+}
 
 // Precompile costs
 pub const ECRECOVER_COST: u64 = 3000;
@@ -183,6 +349,18 @@ pub const P256_VERIFY_COST: u64 = 6900;
 
 // Floor cost per token, specified in https://eips.ethereum.org/EIPS/eip-7623
 pub const TOTAL_COST_FLOOR_PER_TOKEN: u64 = 10;
+// EIP-7976 (Amsterdam+): raised floor
+pub const TOTAL_COST_FLOOR_PER_TOKEN_AMSTERDAM: u64 = 16;
+
+/// Returns the floor cost per token for the given fork.
+/// EIP-7976 raises this from 10 (EIP-7623) to 16 starting at Amsterdam.
+pub fn total_cost_floor_per_token(fork: Fork) -> u64 {
+    if fork >= Fork::Amsterdam {
+        TOTAL_COST_FLOOR_PER_TOKEN_AMSTERDAM
+    } else {
+        TOTAL_COST_FLOOR_PER_TOKEN
+    }
+}
 
 pub const SHA2_256_STATIC_COST: u64 = 60;
 pub const SHA2_256_DYNAMIC_BASE: u64 = 12;
@@ -392,10 +570,10 @@ fn mem_expansion_behavior(
         .ok_or(OutOfGas.into())
 }
 
-pub fn sload(storage_slot_was_cold: bool) -> Result<u64, VMError> {
+pub fn sload(storage_slot_was_cold: bool, fork: Fork) -> Result<u64, VMError> {
     let static_gas = SLOAD_STATIC;
     let dynamic_cost = if storage_slot_was_cold {
-        SLOAD_COLD_DYNAMIC
+        cold_storage_access_cost(fork)
     } else {
         SLOAD_WARM_DYNAMIC
     };
@@ -407,8 +585,30 @@ pub fn sstore(
     current_value: U256,
     new_value: U256,
     storage_slot_was_cold: bool,
+    fork: Fork,
 ) -> Result<u64, VMError> {
     let static_gas = SSTORE_STATIC;
+
+    // EIP-8038 (Amsterdam): access (cold XOR warm) is always charged; STORAGE_WRITE
+    // (10000) is added separately on the first change to the slot this tx. The cold
+    // access is the full cost, not a surcharge on top of the warm cost.
+    if fork >= Fork::Amsterdam {
+        let access = if storage_slot_was_cold {
+            cold_storage_access_cost(fork)
+        } else {
+            SSTORE_DEFAULT_DYNAMIC
+        };
+        let write = if current_value == original_value && new_value != current_value {
+            STORAGE_WRITE_AMSTERDAM
+        } else {
+            0
+        };
+        return static_gas
+            .checked_add(access)
+            .ok_or(OutOfGas)?
+            .checked_add(write)
+            .ok_or(OutOfGas.into());
+    }
 
     let mut base_dynamic_gas = if new_value == current_value {
         SSTORE_DEFAULT_DYNAMIC
@@ -424,7 +624,7 @@ pub fn sstore(
     // https://eips.ethereum.org/EIPS/eip-2929
     if storage_slot_was_cold {
         base_dynamic_gas = base_dynamic_gas
-            .checked_add(SSTORE_COLD_DYNAMIC)
+            .checked_add(cold_storage_access_cost(fork))
             .ok_or(OutOfGas)?;
     }
     static_gas
@@ -522,10 +722,18 @@ fn compute_gas_create(
         0
     };
 
+    // EIP-8038: CREATE/CREATE2 opcode regular base is CREATE_ACCESS (11000);
+    // the new-account leaf is charged separately in state gas.
+    let create_base_cost = if fork >= Fork::Amsterdam {
+        CREATE_ACCESS_AMSTERDAM
+    } else {
+        CREATE_BASE_COST
+    };
+
     let gas_create_cost = memory_expansion_cost
         .checked_add(init_code_cost)
         .ok_or(OutOfGas)?
-        .checked_add(CREATE_BASE_COST)
+        .checked_add(create_base_cost)
         .ok_or(OutOfGas)?
         .checked_add(hash_cost)
         .ok_or(OutOfGas)?;
@@ -533,22 +741,49 @@ fn compute_gas_create(
     Ok(gas_create_cost)
 }
 
+/// Base cost of SELFDESTRUCT before evaluating NEW_ACCOUNT.
+/// Used for EIP-7928 two-phase gas check: first verify base cost is
+/// available (to allow BAL state access), then charge the full cost.
+pub fn selfdestruct_base(address_was_cold: bool, fork: Fork) -> Result<u64, VMError> {
+    let cold_cost = if address_was_cold {
+        cold_account_access_cost(fork)
+    } else {
+        0
+    };
+    SELFDESTRUCT_STATIC
+        .checked_add(cold_cost)
+        .ok_or(OutOfGas.into())
+}
+
 pub fn selfdestruct(
     address_was_cold: bool,
     account_is_empty: bool,
     balance_to_transfer: U256,
+    fork: Fork,
 ) -> Result<u64, VMError> {
     let mut dynamic_cost = if address_was_cold {
-        COLD_ADDRESS_ACCESS_COST
+        cold_account_access_cost(fork)
     } else {
         0
     };
 
-    // If a positive balance is sent to an empty account, the dynamic gas is 25000
+    // If a positive balance is sent to an empty account, the dynamic gas is 25000.
+    // For Amsterdam+, the EIP-7928 new-account cost is moved to state gas (charged
+    // separately via `vm.state_gas_new_account`).
     if account_is_empty && balance_to_transfer > U256::zero() {
-        dynamic_cost = dynamic_cost
-            .checked_add(SELFDESTRUCT_DYNAMIC)
-            .ok_or(OutOfGas)?;
+        if fork >= Fork::Amsterdam {
+            // EIP-8038 (Amsterdam+): an additional ACCOUNT_WRITE (8000) of REGULAR gas
+            // is charged for sending a positive balance to an EIP-161-empty account.
+            // This is a different gas dimension from the EIP-8037 state-gas new-account
+            // charge applied in the SELFDESTRUCT handler, so it is NOT a double-charge.
+            dynamic_cost = dynamic_cost
+                .checked_add(ACCOUNT_WRITE_AMSTERDAM)
+                .ok_or(OutOfGas)?;
+        } else {
+            dynamic_cost = dynamic_cost
+                .checked_add(SELFDESTRUCT_DYNAMIC)
+                .ok_or(OutOfGas)?;
+        }
     }
 
     SELFDESTRUCT_STATIC
@@ -556,43 +791,58 @@ pub fn selfdestruct(
         .ok_or(OutOfGas.into())
 }
 
-pub fn tx_calldata(calldata: &Bytes) -> Result<u64, VMError> {
+pub fn tx_calldata(calldata: &[u8]) -> Result<u64, VMError> {
     // This cost applies both for call and create
-    // 4 gas for each zero byte in the transaction data 16 gas for each non-zero byte in the transaction.
-    let mut calldata_cost: u64 = 0;
-    for byte in calldata {
-        calldata_cost = if *byte != 0 {
-            calldata_cost
-                .checked_add(CALLDATA_COST_NON_ZERO_BYTE)
-                .ok_or(OutOfGas)?
-        } else {
-            calldata_cost
-                .checked_add(CALLDATA_COST_ZERO_BYTE)
-                .ok_or(OutOfGas)?
-        }
-    }
-    Ok(calldata_cost)
-}
+    // 4 gas for each zero byte in the transaction data, 16 gas for each non-zero byte.
+    // Counting non-zero bytes in a single pass autovectorizes; the previous per-byte
+    // branch + `checked_add` did not. Byte-identical to the loop (and to the same
+    // overflow → OutOfGas behavior), since:
+    //   non_zero * 16 + zero * 4  ==  sum over bytes of (16 if non-zero else 4).
+    let len = u64::try_from(calldata.len()).map_err(|_| InternalError::TypeConversion)?;
+    let non_zero_bytes = u64::try_from(calldata.iter().filter(|&&byte| byte != 0).count())
+        .map_err(|_| InternalError::TypeConversion)?;
+    // non_zero_bytes <= len, so this never underflows.
+    let zero_bytes = len.saturating_sub(non_zero_bytes);
 
-pub fn tx_creation(code_length: u64, number_of_words: u64) -> Result<u64, VMError> {
-    let mut creation_cost = code_length.checked_mul(CODE_DEPOSIT_COST).ok_or(OutOfGas)?;
-    creation_cost = creation_cost
-        .checked_add(CREATE_BASE_COST)
+    let non_zero_cost = non_zero_bytes
+        .checked_mul(CALLDATA_COST_NON_ZERO_BYTE)
+        .ok_or(OutOfGas)?;
+    let zero_cost = zero_bytes
+        .checked_mul(CALLDATA_COST_ZERO_BYTE)
         .ok_or(OutOfGas)?;
 
-    // GInitCodeword * number_of_words rounded up. GinitCodeWord = 2
-    let words_cost = number_of_words.checked_mul(2).ok_or(OutOfGas)?;
-    creation_cost.checked_add(words_cost).ok_or(OutOfGas.into())
+    non_zero_cost.checked_add(zero_cost).ok_or(OutOfGas.into())
+}
+
+/// Returns the total byte-size of an access list:
+/// 20 bytes per address entry + 32 bytes per storage key.
+pub fn access_list_bytes(access_list: &AccessList) -> u64 {
+    let mut bytes: u64 = 0;
+    for (_addr, keys) in access_list {
+        bytes = bytes.saturating_add(20);
+        let keys_len = u64::try_from(keys.len()).unwrap_or(u64::MAX);
+        bytes = bytes.saturating_add(32_u64.saturating_mul(keys_len));
+    }
+    bytes
+}
+
+/// EIP-7981: floor_tokens_in_access_list = access_list_bytes * STANDARD_TOKEN_COST (4).
+/// Used in the floor-gas computation for Amsterdam+.
+pub fn floor_tokens_in_access_list(access_list: &AccessList) -> u64 {
+    access_list_bytes(access_list).saturating_mul(STANDARD_TOKEN_COST)
 }
 
 fn address_access_cost(
     address_was_cold: bool,
     static_cost: u64,
-    cold_dynamic_cost: u64,
+    _cold_dynamic_cost: u64,
     warm_dynamic_cost: u64,
+    fork: Fork,
 ) -> Result<u64, VMError> {
+    // EIP-8038 (Amsterdam+) reprices the cold account access component; the
+    // cold constant is selected by fork rather than the per-opcode literal.
     let dynamic_cost: u64 = if address_was_cold {
-        cold_dynamic_cost
+        cold_account_access_cost(fork)
     } else {
         warm_dynamic_cost
     };
@@ -600,22 +850,33 @@ fn address_access_cost(
     static_cost.checked_add(dynamic_cost).ok_or(OutOfGas.into())
 }
 
-pub fn balance(address_was_cold: bool) -> Result<u64, VMError> {
+pub fn balance(address_was_cold: bool, fork: Fork) -> Result<u64, VMError> {
     address_access_cost(
         address_was_cold,
         BALANCE_STATIC,
         BALANCE_COLD_DYNAMIC,
         BALANCE_WARM_DYNAMIC,
+        fork,
     )
 }
 
-pub fn extcodesize(address_was_cold: bool) -> Result<u64, VMError> {
-    address_access_cost(
+pub fn extcodesize(address_was_cold: bool, fork: Fork) -> Result<u64, VMError> {
+    let access_cost = address_access_cost(
         address_was_cold,
         EXTCODESIZE_STATIC,
         EXTCODESIZE_COLD_DYNAMIC,
         EXTCODESIZE_WARM_DYNAMIC,
-    )
+        fork,
+    )?;
+    // EIP-8038 (Amsterdam+): EXTCODESIZE performs two DB reads (account + code),
+    // so it is charged an ADDITIONAL WARM_ACCESS (100) on top of its access cost,
+    // regardless of warm/cold. BALANCE/EXTCODEHASH do NOT get this surcharge.
+    let extra = if fork >= Fork::Amsterdam {
+        WARM_ADDRESS_ACCESS_COST
+    } else {
+        0
+    };
+    access_cost.checked_add(extra).ok_or(OutOfGas.into())
 }
 
 pub fn extcodecopy(
@@ -623,6 +884,7 @@ pub fn extcodecopy(
     new_memory_size: usize,
     current_memory_size: usize,
     address_was_cold: bool,
+    fork: Fork,
 ) -> Result<u64, VMError> {
     let base_access_cost = copy_behavior(
         new_memory_size,
@@ -636,19 +898,32 @@ pub fn extcodecopy(
         EXTCODECOPY_STATIC,
         EXTCODECOPY_COLD_DYNAMIC,
         EXTCODECOPY_WARM_DYNAMIC,
+        fork,
     )?;
+
+    // EIP-8038 (Amsterdam+): EXTCODECOPY performs two DB reads (account + code),
+    // so it is charged an ADDITIONAL WARM_ACCESS (100) on top of its access cost,
+    // regardless of warm/cold. BALANCE/EXTCODEHASH do NOT get this surcharge.
+    let extra = if fork >= Fork::Amsterdam {
+        WARM_ADDRESS_ACCESS_COST
+    } else {
+        0
+    };
 
     base_access_cost
         .checked_add(expansion_access_cost)
+        .ok_or(OutOfGas)?
+        .checked_add(extra)
         .ok_or(OutOfGas.into())
 }
 
-pub fn extcodehash(address_was_cold: bool) -> Result<u64, VMError> {
+pub fn extcodehash(address_was_cold: bool, fork: Fork) -> Result<u64, VMError> {
     address_access_cost(
         address_was_cold,
         EXTCODEHASH_STATIC,
         EXTCODEHASH_COLD_DYNAMIC,
         EXTCODEHASH_WARM_DYNAMIC,
+        fork,
     )
 }
 
@@ -661,6 +936,7 @@ pub fn call(
     value_to_transfer: U256,
     gas_from_stack: U256,
     gas_left: u64,
+    fork: Fork,
 ) -> Result<(u64, u64), VMError> {
     let memory_expansion_cost = memory::expansion_cost(new_memory_size, current_memory_size)?;
 
@@ -669,18 +945,21 @@ pub fn call(
         CALL_STATIC,
         CALL_COLD_DYNAMIC,
         CALL_WARM_DYNAMIC,
+        fork,
     )?;
     let positive_value_cost = if !value_to_transfer.is_zero() {
-        CALL_POSITIVE_VALUE
+        call_positive_value_cost(fork)
     } else {
         0
     };
 
-    let value_to_empty_account = if address_is_empty && !value_to_transfer.is_zero() {
-        CALL_TO_EMPTY_ACCOUNT
-    } else {
-        0
-    };
+    // For Amsterdam+, the new-account cost is moved to state gas (charged separately).
+    let value_to_empty_account =
+        if address_is_empty && !value_to_transfer.is_zero() && fork < Fork::Amsterdam {
+            CALL_TO_EMPTY_ACCOUNT
+        } else {
+            0
+        };
 
     let call_gas_costs = memory_expansion_cost
         .checked_add(address_access_cost)
@@ -706,6 +985,7 @@ pub fn callcode(
     value_to_transfer: U256,
     gas_from_stack: U256,
     gas_left: u64,
+    fork: Fork,
 ) -> Result<(u64, u64), VMError> {
     let memory_expansion_cost = memory::expansion_cost(new_memory_size, current_memory_size)?;
     let address_access_cost = address_access_cost(
@@ -713,10 +993,11 @@ pub fn callcode(
         DELEGATECALL_STATIC,
         DELEGATECALL_COLD_DYNAMIC,
         DELEGATECALL_WARM_DYNAMIC,
+        fork,
     )?;
 
     let positive_value_cost = if !value_to_transfer.is_zero() {
-        CALLCODE_POSITIVE_VALUE
+        call_positive_value_cost(fork)
     } else {
         0
     };
@@ -741,6 +1022,7 @@ pub fn delegatecall(
     address_was_cold: bool,
     gas_from_stack: U256,
     gas_left: u64,
+    fork: Fork,
 ) -> Result<(u64, u64), VMError> {
     let memory_expansion_cost = memory::expansion_cost(new_memory_size, current_memory_size)?;
 
@@ -749,6 +1031,7 @@ pub fn delegatecall(
         DELEGATECALL_STATIC,
         DELEGATECALL_COLD_DYNAMIC,
         DELEGATECALL_WARM_DYNAMIC,
+        fork,
     )?;
 
     let call_gas_costs = memory_expansion_cost
@@ -764,6 +1047,7 @@ pub fn staticcall(
     address_was_cold: bool,
     gas_from_stack: U256,
     gas_left: u64,
+    fork: Fork,
 ) -> Result<(u64, u64), VMError> {
     let memory_expansion_cost = memory::expansion_cost(new_memory_size, current_memory_size)?;
 
@@ -772,6 +1056,7 @@ pub fn staticcall(
         STATICCALL_STATIC,
         STATICCALL_COLD_DYNAMIC,
         STATICCALL_WARM_DYNAMIC,
+        fork,
     )?;
 
     let call_gas_costs = memory_expansion_cost
@@ -779,52 +1064,6 @@ pub fn staticcall(
         .ok_or(OutOfGas)?;
 
     calculate_cost_and_gas_limit_call(true, gas_from_stack, gas_left, call_gas_costs, 0)
-}
-
-/// Approximates factor * e ** (numerator / denominator) using Taylor expansion
-/// https://eips.ethereum.org/EIPS/eip-4844#helpers
-pub fn fake_exponential(factor: U256, numerator: U256, denominator: u64) -> Result<U256, VMError> {
-    if denominator == 0 {
-        return Err(InternalError::DivisionByZero.into());
-    }
-
-    if numerator.is_zero() {
-        return Ok(factor);
-    }
-
-    let mut output: U256 = U256::zero();
-    let denominator_u256: U256 = denominator.into();
-
-    // Initial multiplication: factor * denominator
-    let mut numerator_accum = factor
-        .checked_mul(denominator_u256)
-        .ok_or(InternalError::Overflow)?;
-
-    let mut denominator_by_i = denominator_u256;
-
-    #[expect(
-        clippy::arithmetic_side_effects,
-        reason = "division can't overflow since denominator is not 0"
-    )]
-    {
-        while !numerator_accum.is_zero() {
-            // Safe addition to output
-            output = output
-                .checked_add(numerator_accum)
-                .ok_or(InternalError::Overflow)?;
-
-            // Safe multiplication and division within loop
-            numerator_accum = numerator_accum
-                .checked_mul(numerator)
-                .ok_or(InternalError::Overflow)?
-                / denominator_by_i;
-
-            // denominator comes from a u64 value, will never overflow before other variables.
-            denominator_by_i += denominator_u256;
-        }
-
-        Ok(output / denominator)
-    }
 }
 
 pub fn sha2_256(data_size: usize) -> Result<u64, VMError> {

@@ -1,76 +1,83 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
+use aligned_sdk::gateway::provider::AggregationModeGatewayProvider;
+#[cfg(feature = "sp1")]
+use aligned_sdk::gateway::provider::GatewayError;
+use aligned_sdk::types::Network;
+use alloy::signers::local::PrivateKeySigner;
 use ethrex_common::{Address, U256};
 use ethrex_l2_common::{
     calldata::Value,
-    prover::{BatchProof, ProverType},
+    prover::{ProverOutput, ProverType},
 };
 use ethrex_l2_rpc::signer::{Signer, SignerHealth};
-use ethrex_l2_sdk::{calldata::encode_calldata, get_last_committed_batch};
+use ethrex_l2_sdk::{calldata::encode_calldata, get_last_committed_batch, get_last_verified_batch};
 #[cfg(feature = "metrics")]
 use ethrex_metrics::l2::metrics::METRICS;
 use ethrex_metrics::metrics;
 use ethrex_rpc::{
     EthClient,
-    clients::{EthClientError, eth::errors::EstimateGasError},
+    clients::{EthClientError, eth::errors::RpcRequestError},
 };
 use ethrex_storage_rollup::StoreRollup;
 use serde::Serialize;
-use spawned_concurrency::tasks::{
-    CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
+use spawned_concurrency::{
+    actor,
+    error::ActorError,
+    protocol,
+    tasks::{Actor, ActorRef, ActorStart as _, Context, Handler, Response, send_after},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use super::{
     configs::AlignedConfig,
-    utils::{get_latest_sent_batch, random_duration, send_verify_tx},
+    utils::{
+        INVALID_RISC0_PROOF_SELECTOR, INVALID_SP1_PROOF_SELECTOR, INVALID_TDX_PROOF_SELECTOR,
+        random_duration, send_verify_tx,
+    },
 };
 
 use crate::{
     CommitterConfig, EthConfig, ProofCoordinatorConfig, SequencerConfig,
-    based::sequencer_state::{SequencerState, SequencerStatus},
-    sequencer::errors::ProofSenderError,
+    sequencer::{errors::ProofSenderError, utils::remove_batch_checkpoint},
 };
-use aligned_sdk::{
-    common::{
-        errors,
-        types::{FeeEstimationType, Network, ProvingSystemId, VerificationData},
-    },
-    verification_layer::{estimate_fee as aligned_estimate_fee, get_nonce_from_batcher, submit},
-};
+use ethrex_l2_common::sequencer_state::{SequencerState, SequencerStatus};
 
-use ethers::signers::{Signer as EthersSigner, Wallet};
+#[cfg(feature = "sp1")]
+use ethrex_guest_program::ZKVM_SP1_PROGRAM_ELF;
+#[cfg(feature = "sp1")]
+use sp1_sdk::{HashableKey, Prover, SP1ProofWithPublicValues, SP1VerifyingKey};
 
-const VERIFY_FUNCTION_SIGNATURE: &str = "verifyBatch(uint256,bytes,bytes,bytes,bytes,bytes,bytes)";
+const VERIFY_BATCHES_FUNCTION_SIGNATURE: &str = "verifyBatches(uint256,bytes[],bytes[],bytes[])";
 
-#[derive(Clone)]
-pub enum InMessage {
-    Send,
-}
-
-#[derive(Clone)]
-pub enum OutMessage {
-    Done,
-    Health(Box<L1ProofSenderHealth>),
-}
-
-#[derive(Clone)]
-pub enum CallMessage {
-    Health,
+#[protocol]
+pub trait L1ProofSenderProtocol: Send + Sync {
+    fn send_proof(&self) -> Result<(), ActorError>;
+    fn health(&self) -> Response<Box<L1ProofSenderHealth>>;
 }
 
 pub struct L1ProofSender {
     eth_client: EthClient,
     signer: ethrex_l2_rpc::signer::Signer,
     on_chain_proposer_address: Address,
+    timelock_address: Option<Address>,
     needed_proof_types: Vec<ProverType>,
     proof_send_interval_ms: u64,
     sequencer_state: SequencerState,
     rollup_store: StoreRollup,
     l1_chain_id: u64,
     network: Network,
-    fee_estimate: FeeEstimationType,
-    aligned_sp1_elf_path: String,
+    /// Directory where checkpoints are stored.
+    checkpoints_dir: PathBuf,
+    aligned_mode: bool,
+    /// Timeout in seconds before resending a proof not yet verified on-chain (aligned mode).
+    resubmission_timeout_secs: u64,
+    /// Cached SP1 verifying key for aligned mode
+    #[cfg(feature = "sp1")]
+    sp1_vk: Option<SP1VerifyingKey>,
 }
 
 #[derive(Clone, Serialize)]
@@ -83,13 +90,11 @@ pub struct L1ProofSenderHealth {
     sequencer_state: String,
     l1_chain_id: u64,
     network: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    fee_estimate: Option<FeeEstimationType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    aligned_sp1_elf_path: Option<String>,
 }
 
+#[actor(protocol = L1ProofSenderProtocol)]
 impl L1ProofSender {
+    #[expect(clippy::too_many_arguments)]
     async fn new(
         cfg: &ProofCoordinatorConfig,
         committer_cfg: &CommitterConfig,
@@ -98,9 +103,10 @@ impl L1ProofSender {
         aligned_cfg: &AlignedConfig,
         rollup_store: StoreRollup,
         needed_proof_types: Vec<ProverType>,
+        checkpoints_dir: PathBuf,
     ) -> Result<Self, ProofSenderError> {
         let eth_client = EthClient::new_with_config(
-            eth_cfg.rpc_url.iter().map(AsRef::as_ref).collect(),
+            eth_cfg.rpc_url.clone(),
             eth_cfg.max_number_of_retries,
             eth_cfg.backoff_factor,
             eth_cfg.min_retry_delay,
@@ -111,22 +117,41 @@ impl L1ProofSender {
         let l1_chain_id = eth_client.get_chain_id().await?.try_into().map_err(|_| {
             ProofSenderError::UnexpectedError("Failed to convert chain ID to U256".to_owned())
         })?;
-        let fee_estimate = resolve_fee_estimate(&aligned_cfg.fee_estimate)?;
-        let aligned_sp1_elf_path = aligned_cfg.aligned_sp1_elf_path.clone();
+
+        // Initialize SP1 verifying key if in aligned mode with sp1 feature
+        #[cfg(feature = "sp1")]
+        let sp1_vk = if aligned_cfg.aligned_mode {
+            Some(Self::init_sp1_vk()?)
+        } else {
+            None
+        };
 
         Ok(Self {
             eth_client,
             signer: cfg.signer.clone(),
             on_chain_proposer_address: committer_cfg.on_chain_proposer_address,
+            timelock_address: committer_cfg.timelock_address,
             needed_proof_types,
             proof_send_interval_ms: cfg.proof_send_interval_ms,
             sequencer_state,
             rollup_store,
             l1_chain_id,
             network: aligned_cfg.network.clone(),
-            fee_estimate,
-            aligned_sp1_elf_path,
+            checkpoints_dir,
+            aligned_mode: aligned_cfg.aligned_mode,
+            resubmission_timeout_secs: aligned_cfg.resubmission_timeout_secs,
+            #[cfg(feature = "sp1")]
+            sp1_vk,
         })
+    }
+
+    #[cfg(feature = "sp1")]
+    fn init_sp1_vk() -> Result<SP1VerifyingKey, ProofSenderError> {
+        // Setup the prover client to get the verifying key
+        let client = sp1_sdk::CpuProver::new();
+        let (_pk, vk) = client.setup(ZKVM_SP1_PROGRAM_ELF);
+        info!("Initialized SP1 verifying key: {}", vk.bytes32());
+        Ok(vk)
     }
 
     pub async fn spawn(
@@ -134,7 +159,8 @@ impl L1ProofSender {
         sequencer_state: SequencerState,
         rollup_store: StoreRollup,
         needed_proof_types: Vec<ProverType>,
-    ) -> Result<GenServerHandle<L1ProofSender>, ProofSenderError> {
+        checkpoints_dir: PathBuf,
+    ) -> Result<ActorRef<L1ProofSender>, ProofSenderError> {
         let state = Self::new(
             &cfg.proof_coordinator,
             &cfg.l1_committer,
@@ -143,29 +169,170 @@ impl L1ProofSender {
             &cfg.aligned,
             rollup_store,
             needed_proof_types,
+            checkpoints_dir,
         )
         .await?;
-        let mut l1_proof_sender = L1ProofSender::start(state);
-        l1_proof_sender
-            .cast(InMessage::Send)
-            .await
-            .map_err(ProofSenderError::InternalError)?;
-        Ok(l1_proof_sender)
+        let actor_ref = state.start();
+        Ok(actor_ref)
     }
 
-    async fn verify_and_send_proof(&mut self) -> Result<(), ProofSenderError> {
-        let batch_to_send = 1 + get_latest_sent_batch(
-            self.needed_proof_types.clone(),
-            &self.rollup_store,
-            &self.eth_client,
-            self.on_chain_proposer_address,
-        )
-        .await
-        .map_err(|err| {
-            error!("Failed to get next batch to send: {err}");
-            ProofSenderError::UnexpectedError(err.to_string())
-        })?;
+    #[started]
+    async fn started(&mut self, ctx: &Context<Self>) {
+        let _ = ctx
+            .send(l1_proof_sender_protocol::SendProof)
+            .inspect_err(|e| error!("Failed to send initial SendProof: {e}"));
+    }
 
+    #[send_handler]
+    async fn handle_send_proof(
+        &mut self,
+        _msg: l1_proof_sender_protocol::SendProof,
+        ctx: &Context<Self>,
+    ) {
+        if let SequencerStatus::Sequencing = self.sequencer_state.status() {
+            let _ = self
+                .verify_and_send_proofs()
+                .await
+                .inspect_err(|err| error!("L1 Proof Sender: {err}"));
+        }
+        let check_interval = random_duration(self.proof_send_interval_ms);
+        send_after(
+            check_interval,
+            ctx.clone(),
+            l1_proof_sender_protocol::SendProof,
+        );
+    }
+
+    #[request_handler]
+    async fn handle_health(
+        &mut self,
+        _msg: l1_proof_sender_protocol::Health,
+        _ctx: &Context<Self>,
+    ) -> Box<L1ProofSenderHealth> {
+        let rpc_healthcheck = self.eth_client.test_urls().await;
+        let signer_status = self.signer.health().await;
+
+        Box::new(L1ProofSenderHealth {
+            rpc_healthcheck,
+            signer_status,
+            on_chain_proposer_address: self.on_chain_proposer_address,
+            needed_proof_types: self
+                .needed_proof_types
+                .iter()
+                .map(|proof_type| format!("{:?}", proof_type))
+                .collect(),
+            proof_send_interval_ms: self.proof_send_interval_ms,
+            sequencer_state: format!("{:?}", self.sequencer_state.status()),
+            l1_chain_id: self.l1_chain_id,
+            network: format!("{:?}", self.network),
+        })
+    }
+
+    async fn verify_and_send_proofs(&self) -> Result<(), ProofSenderError> {
+        let last_verified_batch =
+            get_last_verified_batch(&self.eth_client, self.on_chain_proposer_address).await?;
+
+        if self.aligned_mode {
+            let mut latest_sent_to_aligned = self.rollup_store.get_latest_sent_to_aligned().await?;
+
+            // Read the verified cursor (written only by the Verifier) for timeout detection.
+            let (_, verified_at) = self.rollup_store.get_latest_verified_batch_proof().await?;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| ProofSenderError::UnexpectedError(e.to_string()))?
+                .as_secs();
+
+            // Time-based resubmission: if we sent a proof but verification hasn't
+            // advanced after the timeout, reset cursor to resend.
+            // The `verified_at > 0` guard prevents spurious timeout triggers on
+            // initial startup before any batch has been verified on-chain.
+            if latest_sent_to_aligned > last_verified_batch
+                && verified_at > 0
+                && now.saturating_sub(verified_at) > self.resubmission_timeout_secs
+            {
+                error!(
+                    latest_sent_to_aligned,
+                    last_verified_batch,
+                    elapsed_secs = now.saturating_sub(verified_at),
+                    "Aligned verification timed out, attempting resubmission"
+                );
+                self.rollup_store
+                    .set_latest_sent_to_aligned(last_verified_batch)
+                    .await?;
+                latest_sent_to_aligned = last_verified_batch;
+            }
+
+            // Sync aligned cursor if on-chain verification advanced past it
+            if latest_sent_to_aligned < last_verified_batch {
+                self.rollup_store
+                    .set_latest_sent_to_aligned(last_verified_batch)
+                    .await?;
+                latest_sent_to_aligned = last_verified_batch;
+            }
+
+            let batch_to_send = latest_sent_to_aligned + 1;
+            return self.verify_and_send_proofs_aligned(batch_to_send).await;
+        }
+
+        let (latest_verified_db, _) = self.rollup_store.get_latest_verified_batch_proof().await?;
+
+        // If the DB is behind on-chain, sync it up to avoid stalling the proof coordinator
+        if latest_verified_db < last_verified_batch {
+            self.rollup_store
+                .set_latest_verified_batch_proof(last_verified_batch, 0)
+                .await?;
+        }
+
+        let first_batch = last_verified_batch + 1;
+
+        let last_committed_batch =
+            get_last_committed_batch(&self.eth_client, self.on_chain_proposer_address).await?;
+
+        if last_committed_batch < first_batch {
+            info!("Next batch to send ({first_batch}) is not yet committed");
+            return Ok(());
+        }
+
+        // Collect consecutive proven batches starting from first_batch
+        let mut ready_batches: Vec<(u64, HashMap<ProverType, ProverOutput>)> = Vec::new();
+        for batch in first_batch..=last_committed_batch {
+            let mut proofs = HashMap::new();
+            let mut all_present = true;
+            for proof_type in &self.needed_proof_types {
+                if let Some(proof) = self
+                    .rollup_store
+                    .get_proof_by_batch_and_type(batch, *proof_type)
+                    .await?
+                {
+                    proofs.insert(*proof_type, proof);
+                } else {
+                    all_present = false;
+                    break;
+                }
+            }
+            if !all_present {
+                break;
+            }
+            ready_batches.push((batch, proofs));
+        }
+
+        if ready_batches.is_empty() {
+            info!(
+                ?first_batch,
+                "No consecutive batches ready to send starting from first_batch"
+            );
+            return Ok(());
+        }
+
+        self.send_batches_proof_to_contract(first_batch, &ready_batches)
+            .await
+    }
+
+    async fn verify_and_send_proofs_aligned(
+        &self,
+        batch_to_send: u64,
+    ) -> Result<(), ProofSenderError> {
         let last_committed_batch =
             get_last_committed_batch(&self.eth_client, self.on_chain_proposer_address).await?;
 
@@ -189,16 +356,12 @@ impl L1ProofSender {
         }
 
         if missing_proof_types.is_empty() {
-            // TODO: we should put in code that if the prover is running with Aligned, then there
-            // shouldn't be any other required types.
-            if let Some(aligned_proof) = proofs.remove(&ProverType::Aligned) {
-                self.send_proof_to_aligned(batch_to_send, aligned_proof)
-                    .await?;
-            } else {
-                self.send_proof_to_contract(batch_to_send, proofs).await?;
-            }
+            self.send_proof_to_aligned(batch_to_send, proofs.values())
+                .await?;
+            // Only advance the aligned cursor, NOT the verified cursor.
+            // The verified cursor is advanced by the verifier after on-chain verification.
             self.rollup_store
-                .set_lastest_sent_batch_proof(batch_to_send)
+                .set_latest_sent_to_aligned(batch_to_send)
                 .await?;
         } else {
             let missing_proof_types: Vec<String> = missing_proof_types
@@ -206,9 +369,9 @@ impl L1ProofSender {
                 .map(|proof_type| format!("{proof_type:?}"))
                 .collect();
             info!(
+                ?missing_proof_types,
                 ?batch_to_send,
-                "Missing {} batch proof(s), will not send",
-                missing_proof_types.join(", ")
+                "Missing batch proof(s), will not send",
             );
         }
 
@@ -216,30 +379,11 @@ impl L1ProofSender {
     }
 
     async fn send_proof_to_aligned(
-        &mut self,
+        &self,
         batch_number: u64,
-        aligned_proof: BatchProof,
+        batch_proofs: impl IntoIterator<Item = &ProverOutput>,
     ) -> Result<(), ProofSenderError> {
-        let elf = std::fs::read(self.aligned_sp1_elf_path.clone()).map_err(|e| {
-            ProofSenderError::UnexpectedError(format!("Failed to read ELF file: {e}"))
-        })?;
-
-        let verification_data = VerificationData {
-            proving_system: ProvingSystemId::SP1,
-            proof: aligned_proof.proof(),
-            proof_generator_addr: self.signer.address().0.into(),
-            vm_program_code: Some(elf),
-            verification_key: None,
-            pub_input: None,
-        };
-
-        let fee_estimation = self.estimate_fee().await?;
-
-        let nonce = get_nonce_from_batcher(self.network.clone(), self.signer.address().0.into())
-            .await
-            .map_err(|err| {
-                ProofSenderError::AlignedGetNonceError(format!("Failed to get nonce: {err:?}"))
-            })?;
+        info!(?batch_number, "Sending batch proof(s) to Aligned Layer");
 
         let Signer::Local(local_signer) = &self.signer else {
             return Err(ProofSenderError::UnexpectedError(
@@ -247,211 +391,333 @@ impl L1ProofSender {
             ));
         };
 
-        let wallet = Wallet::from_bytes(local_signer.private_key.as_ref())
-            .map_err(|_| ProofSenderError::UnexpectedError("Failed to create wallet".to_owned()))?;
-
-        let wallet = wallet.with_chain_id(self.l1_chain_id);
-
-        debug!("Sending proof to Aligned");
-
-        let algined_verification_result = submit(
-            self.network.clone(),
-            &verification_data,
-            fee_estimation,
-            wallet,
-            nonce,
-        )
-        .await;
-
-        if let Err(errors::SubmitError::InvalidProof(_)) = algined_verification_result.as_ref() {
-            warn!("Deleting invalid ALIGNED proof");
-            self.rollup_store
-                .delete_proof_by_batch_and_type(batch_number, ProverType::Aligned)
-                .await?;
-        }
-
-        algined_verification_result.map_err(|err| {
-            ProofSenderError::AlignedSubmitProofError(format!("Failed to submit proof: {err}"))
+        // Create alloy signer from private key
+        // Convert secp256k1::SecretKey to FixedBytes<32> for alloy signer
+        let private_key_bytes: [u8; 32] = local_signer.private_key.secret_bytes();
+        let signer = PrivateKeySigner::from_bytes(&private_key_bytes.into()).map_err(|e| {
+            ProofSenderError::UnexpectedError(format!("Failed to create signer: {e}"))
         })?;
 
-        info!("Proof for batch {batch_number} sent to Aligned");
+        let sender_address = format!("{:?}", self.signer.address());
+
+        // Create the gateway provider with signer
+        let gateway = AggregationModeGatewayProvider::new_with_signer(self.network.clone(), signer)
+            .map_err(|e| {
+                ProofSenderError::UnexpectedError(format!("Failed to create gateway: {e:?}"))
+            })?;
+
+        for batch_proof in batch_proofs {
+            let prover_type = batch_proof.prover_type();
+
+            match prover_type {
+                ProverType::SP1 => {
+                    self.submit_sp1_proof_to_aligned(
+                        &gateway,
+                        &sender_address,
+                        batch_number,
+                        batch_proof,
+                    )
+                    .await?;
+                }
+                // Future: Add risc0, zisk, etc. support here
+                _ => {
+                    warn!(
+                        ?prover_type,
+                        "Prover type not yet supported for Aligned, skipping"
+                    );
+                    return Err(ProofSenderError::AlignedUnsupportedProverType(
+                        prover_type.to_string(),
+                    ));
+                }
+            }
+        }
 
         Ok(())
     }
 
-    /// Performs a call to aligned SDK estimate_fee function with retries over all RPC URLs.
-    async fn estimate_fee(&mut self) -> Result<ethers::types::U256, ProofSenderError> {
-        for rpc_url in &self.eth_client.urls {
-            if let Ok(estimation) =
-                aligned_estimate_fee(rpc_url.as_str(), self.fee_estimate.clone()).await
-            {
-                return Ok(estimation);
+    #[cfg(feature = "sp1")]
+    async fn submit_sp1_proof_to_aligned(
+        &self,
+        gateway: &AggregationModeGatewayProvider<PrivateKeySigner>,
+        sender_address: &str,
+        batch_number: u64,
+        batch_proof: &ProverOutput,
+    ) -> Result<(), ProofSenderError> {
+        let prover_type = batch_proof.prover_type();
+
+        let sp1_vk = self.sp1_vk.as_ref().ok_or_else(|| {
+            ProofSenderError::UnexpectedError("SP1 verifying key not initialized".to_string())
+        })?;
+
+        // Deserialize the proof from bincode format
+        let proof: SP1ProofWithPublicValues =
+            bincode::deserialize(&batch_proof.proof_bytes().proof).map_err(|e| {
+                ProofSenderError::UnexpectedError(format!("Failed to deserialize SP1 proof: {e}"))
+            })?;
+
+        // Get the nonce that will be used for this submission
+        let nonce = gateway
+            .get_nonce_for(sender_address.to_string())
+            .await
+            .map_err(|e| ProofSenderError::AlignedGetNonceError(format!("{e:?}")))?
+            .data
+            .nonce;
+
+        info!(
+            ?prover_type,
+            ?batch_number,
+            ?nonce,
+            "Submitting proof to Aligned"
+        );
+
+        let result = gateway.submit_sp1_proof(&proof, sp1_vk).await;
+
+        match result {
+            Ok(response) => {
+                info!(
+                    ?batch_number,
+                    ?nonce,
+                    task_id = ?response.data.task_id,
+                    "Submitted proof to Aligned"
+                );
+            }
+            Err(GatewayError::Api { status, message }) if message.contains("invalid") => {
+                warn!("Proof is invalid, will be deleted: {message}");
+                self.rollup_store
+                    .delete_proof_by_batch_and_type(batch_number, prover_type)
+                    .await?;
+                return Err(ProofSenderError::AlignedSubmitProofError(
+                    GatewayError::Api { status, message },
+                ));
+            }
+            Err(e) => {
+                return Err(ProofSenderError::AlignedSubmitProofError(e));
             }
         }
-        Err(ProofSenderError::AlignedFeeEstimateError(
-            "All Ethereum RPC URLs failed".to_string(),
+
+        Ok(())
+    }
+
+    #[cfg(not(feature = "sp1"))]
+    async fn submit_sp1_proof_to_aligned(
+        &self,
+        _gateway: &AggregationModeGatewayProvider<PrivateKeySigner>,
+        _sender_address: &str,
+        _batch_number: u64,
+        _batch_proof: &ProverOutput,
+    ) -> Result<(), ProofSenderError> {
+        Err(ProofSenderError::UnexpectedError(
+            "SP1 proofs require the 'sp1' feature to be enabled".to_string(),
         ))
     }
 
-    pub async fn send_proof_to_contract(
-        &mut self,
-        batch_number: u64,
-        proofs: HashMap<ProverType, BatchProof>,
-    ) -> Result<(), ProofSenderError> {
-        info!(
-            ?batch_number,
-            "Sending batch verification transaction to L1"
-        );
+    /// Builds calldata and sends a verifyBatches transaction for the given batches.
+    /// Returns the tx result without any fallback logic.
+    async fn send_verify_batches_tx(
+        &self,
+        first_batch: u64,
+        batches: &[(u64, &HashMap<ProverType, ProverOutput>)],
+    ) -> Result<ethrex_common::H256, EthClientError> {
+        let batch_count = batches.len();
 
-        let calldata_values = [
-            &[Value::Uint(U256::from(batch_number))],
-            proofs
-                .get(&ProverType::RISC0)
-                .map(|proof| proof.calldata())
-                .unwrap_or(ProverType::RISC0.empty_calldata())
-                .as_slice(),
-            proofs
-                .get(&ProverType::SP1)
-                .map(|proof| proof.calldata())
-                .unwrap_or(ProverType::SP1.empty_calldata())
-                .as_slice(),
-            proofs
-                .get(&ProverType::TDX)
-                .map(|proof| proof.calldata())
-                .unwrap_or(ProverType::TDX.empty_calldata())
-                .as_slice(),
-        ]
-        .concat();
+        let mut risc0_array = Vec::with_capacity(batch_count);
+        let mut sp1_array = Vec::with_capacity(batch_count);
+        let mut tdx_array = Vec::with_capacity(batch_count);
 
-        let calldata = encode_calldata(VERIFY_FUNCTION_SIGNATURE, &calldata_values)?;
-
-        let send_verify_tx_result = send_verify_tx(
-            calldata,
-            &self.eth_client,
-            self.on_chain_proposer_address,
-            &self.signer,
-        )
-        .await;
-
-        if let Err(EthClientError::EstimateGasError(EstimateGasError::RPCError(error))) =
-            send_verify_tx_result.as_ref()
-        {
-            if error.contains("Invalid TDX proof") {
-                warn!("Deleting invalid TDX proof");
-                self.rollup_store
-                    .delete_proof_by_batch_and_type(batch_number, ProverType::TDX)
-                    .await?;
-            } else if error.contains("Invalid RISC0 proof") {
-                warn!("Deleting invalid RISC0 proof");
-                self.rollup_store
-                    .delete_proof_by_batch_and_type(batch_number, ProverType::RISC0)
-                    .await?;
-            } else if error.contains("Invalid SP1 proof") {
-                warn!("Deleting invalid SP1 proof");
-                self.rollup_store
-                    .delete_proof_by_batch_and_type(batch_number, ProverType::SP1)
-                    .await?;
-            }
+        for (_batch_number, proofs) in batches {
+            let proof_to_value = |pt: ProverType| -> Value {
+                proofs
+                    .get(&pt)
+                    .map(|p| Value::Bytes(p.proof_bytes().proof.clone().into()))
+                    .unwrap_or(Value::Bytes(vec![].into()))
+            };
+            risc0_array.push(proof_to_value(ProverType::RISC0));
+            sp1_array.push(proof_to_value(ProverType::SP1));
+            tdx_array.push(proof_to_value(ProverType::TDX));
         }
 
-        let verify_tx_hash = send_verify_tx_result?;
+        let calldata_values = vec![
+            Value::Uint(U256::from(first_batch)),
+            Value::Array(risc0_array),
+            Value::Array(sp1_array),
+            Value::Array(tdx_array),
+        ];
+
+        let calldata = encode_calldata(VERIFY_BATCHES_FUNCTION_SIGNATURE, &calldata_values)
+            .map_err(|e| {
+                EthClientError::Custom(format!("Failed to encode verifyBatches calldata: {e}"))
+            })?;
+
+        let target_address = self
+            .timelock_address
+            .unwrap_or(self.on_chain_proposer_address);
+
+        send_verify_tx(calldata, &self.eth_client, target_address, &self.signer).await
+    }
+
+    /// Returns the prover type whose proof is invalid based on the RPC error data
+    /// (custom error selector), or `None` if the data doesn't indicate an invalid proof.
+    ///
+    /// These three selectors cover all proof-related errors:
+    /// `_verifyBatchInternal` wraps each verifier call in try/catch, so any
+    /// verifier failure becomes one of these. Other reverts (BatchNotSequential,
+    /// etc.) are ordering issues where deleting proofs would be wrong.
+    /// Aligned mode uses `AlignedProofVerificationFailed` instead (see l1_proof_verifier).
+    fn invalid_proof_type_from_data(data: &str) -> Option<ProverType> {
+        if data.starts_with(INVALID_TDX_PROOF_SELECTOR) {
+            Some(ProverType::TDX)
+        } else if data.starts_with(INVALID_RISC0_PROOF_SELECTOR) {
+            Some(ProverType::RISC0)
+        } else if data.starts_with(INVALID_SP1_PROOF_SELECTOR) {
+            Some(ProverType::SP1)
+        } else {
+            None
+        }
+    }
+
+    /// If the error data contains an invalid proof custom error selector,
+    /// deletes the offending proof from the store. Unrecognized errors are
+    /// left alone — see `invalid_proof_type_from_data`.
+    async fn try_delete_invalid_proof(
+        &self,
+        data: &str,
+        batch_number: u64,
+    ) -> Result<(), ProofSenderError> {
+        if let Some(proof_type) = Self::invalid_proof_type_from_data(data) {
+            warn!("Deleting invalid {proof_type:?} proof for batch {batch_number}");
+            self.rollup_store
+                .delete_proof_by_batch_and_type(batch_number, proof_type)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Updates `latest_verified_batch_proof` in the store and removes the
+    /// checkpoint directory for the previous batch.
+    /// Used in non-aligned mode where sending = verifying.
+    /// Aligned mode: checkpoint cleanup is handled by the verifier instead.
+    async fn finalize_batch_proof(&self, batch_number: u64) -> Result<(), ProofSenderError> {
+        // verified_at=0: non-aligned mode doesn't use the timeout mechanism.
+        self.rollup_store
+            .set_latest_verified_batch_proof(batch_number, 0)
+            .await?;
+        remove_batch_checkpoint(&self.checkpoints_dir, batch_number);
+        Ok(())
+    }
+
+    /// Sends a single batch proof via verifyBatches, deleting the invalid proof
+    /// from the store if the transaction reverts. On success, updates progress
+    /// and cleans up the checkpoint.
+    async fn send_single_batch_proof(
+        &self,
+        batch_number: u64,
+        proofs: &HashMap<ProverType, ProverOutput>,
+    ) -> Result<(), ProofSenderError> {
+        let single_batch = [(batch_number, proofs)];
+        let result = self
+            .send_verify_batches_tx(batch_number, &single_batch)
+            .await;
+
+        if let Err(EthClientError::RpcRequestError(RpcRequestError::RPCError {
+            data: Some(ref data),
+            ..
+        })) = result
+        {
+            self.try_delete_invalid_proof(data, batch_number).await?;
+        }
+        let verify_tx_hash = result?;
 
         metrics!(
+            let tx_hash_str = format!("{verify_tx_hash:?}");
             let verify_tx_receipt = self
                 .eth_client
                 .get_transaction_receipt(verify_tx_hash)
                 .await?
                 .ok_or(ProofSenderError::UnexpectedError("no verify tx receipt".to_string()))?;
             let verify_gas_used = verify_tx_receipt.tx_info.gas_used.try_into()?;
-            METRICS.set_batch_verification_gas(batch_number, verify_gas_used)?;
+            METRICS.set_batch_verification_gas(batch_number, verify_gas_used, &tx_hash_str)?;
         );
 
         self.rollup_store
             .store_verify_tx_by_batch(batch_number, verify_tx_hash)
             .await?;
+        self.finalize_batch_proof(batch_number).await?;
+        Ok(())
+    }
+
+    /// Sends one or more consecutive batch proofs in a single verifyBatches transaction.
+    /// On revert with an invalid proof message, falls back to sending each batch
+    /// individually to identify which batch has the bad proof.
+    async fn send_batches_proof_to_contract(
+        &self,
+        first_batch: u64,
+        batches: &[(u64, HashMap<ProverType, ProverOutput>)],
+    ) -> Result<(), ProofSenderError> {
+        let batch_count = batches.len();
+        let last_batch = batches.last().map(|(n, _)| *n).unwrap_or(first_batch);
+        info!(
+            first_batch,
+            last_batch, "Sending batch verification transaction to L1"
+        );
+
+        let batch_refs: Vec<(u64, &HashMap<ProverType, ProverOutput>)> =
+            batches.iter().map(|(n, p)| (*n, p)).collect();
+        let send_verify_tx_result = self.send_verify_batches_tx(first_batch, &batch_refs).await;
+
+        // On any error with multiple batches, fall back to single-batch sending
+        // so that a gas limit / calldata issue doesn't block the sequencer.
+        // For single-batch failures, try to delete the invalid proof if applicable.
+        if let Err(ref err) = send_verify_tx_result {
+            if batch_count > 1 {
+                warn!("Multi-batch verify failed ({err}), falling back to single-batch sending");
+                for (batch_number, proofs) in batches {
+                    // The `?` here is intentional: on-chain verification is sequential, so if
+                    // batch N fails (e.g. invalid proof), batches N+1, N+2, ... would also fail
+                    // since the contract requires batchNumber == lastVerifiedBatch + 1.
+                    self.send_single_batch_proof(*batch_number, proofs).await?;
+                }
+                return Ok(());
+            }
+            if let EthClientError::RpcRequestError(RpcRequestError::RPCError {
+                data: Some(data),
+                ..
+            }) = err
+                && let Some((batch_number, _)) = batches.first()
+            {
+                self.try_delete_invalid_proof(data, *batch_number).await?;
+            }
+        }
+
+        let verify_tx_hash = send_verify_tx_result?;
+
+        metrics!(
+            let tx_hash_str = format!("{verify_tx_hash:?}");
+            let verify_tx_receipt = self
+                .eth_client
+                .get_transaction_receipt(verify_tx_hash)
+                .await?
+                .ok_or(ProofSenderError::UnexpectedError("no verify tx receipt".to_string()))?;
+            let tx_gas: i64 = verify_tx_receipt.tx_info.gas_used.try_into()?;
+            for (batch_number, _) in batches {
+                METRICS.set_batch_verification_gas(*batch_number, tx_gas, &tx_hash_str)?;
+            }
+        );
+
+        // Store verify tx hash and finalize each batch
+        for (batch_number, _) in batches {
+            self.rollup_store
+                .store_verify_tx_by_batch(*batch_number, verify_tx_hash)
+                .await?;
+            self.finalize_batch_proof(*batch_number).await?;
+        }
 
         info!(
-            ?batch_number,
+            first_batch,
+            last_batch,
             ?verify_tx_hash,
             "Sent batch verification transaction to L1"
         );
 
         Ok(())
-    }
-
-    async fn health(&self) -> CallResponse<Self> {
-        let rpc_healthcheck = self.eth_client.test_urls().await;
-        let signer_status = self.signer.health().await;
-
-        let (fee_estimate, aligned_sp1_elf_path) =
-            if self.needed_proof_types.contains(&ProverType::Aligned) {
-                (
-                    Some(self.fee_estimate.clone()),
-                    Some(self.aligned_sp1_elf_path.clone()),
-                )
-            } else {
-                (None, None)
-            };
-        CallResponse::Reply(OutMessage::Health(Box::new(L1ProofSenderHealth {
-            rpc_healthcheck,
-            signer_status,
-            on_chain_proposer_address: self.on_chain_proposer_address,
-            needed_proof_types: self
-                .needed_proof_types
-                .iter()
-                .map(|proof_type| format!("{:?}", proof_type))
-                .collect(),
-            proof_send_interval_ms: self.proof_send_interval_ms,
-            sequencer_state: format!("{:?}", self.sequencer_state.status().await),
-            l1_chain_id: self.l1_chain_id,
-            network: format!("{:?}", self.network),
-            fee_estimate,
-            aligned_sp1_elf_path,
-        })))
-    }
-}
-
-impl GenServer for L1ProofSender {
-    type CallMsg = CallMessage;
-    type CastMsg = InMessage;
-    type OutMsg = OutMessage;
-
-    type Error = ProofSenderError;
-
-    async fn handle_cast(
-        &mut self,
-        _message: Self::CastMsg,
-        handle: &GenServerHandle<Self>,
-    ) -> CastResponse {
-        // Right now we only have the Send message, so we ignore the message
-        if let SequencerStatus::Sequencing = self.sequencer_state.status().await {
-            let _ = self
-                .verify_and_send_proof()
-                .await
-                .inspect_err(|err| error!("L1 Proof Sender: {err}"));
-        }
-        let check_interval = random_duration(self.proof_send_interval_ms);
-        send_after(check_interval, handle.clone(), Self::CastMsg::Send);
-        CastResponse::NoReply
-    }
-
-    async fn handle_call(
-        &mut self,
-        message: Self::CallMsg,
-        _handle: &GenServerHandle<Self>,
-    ) -> CallResponse<Self> {
-        match message {
-            CallMessage::Health => self.health().await,
-        }
-    }
-}
-
-fn resolve_fee_estimate(fee_estimate: &str) -> Result<FeeEstimationType, ProofSenderError> {
-    match fee_estimate {
-        "instant" => Ok(FeeEstimationType::Instant),
-        "default" => Ok(FeeEstimationType::Default),
-        _ => Err(ProofSenderError::AlignedFeeEstimateError(
-            "Unsupported fee estimation type".to_string(),
-        )),
     }
 }

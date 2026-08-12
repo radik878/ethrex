@@ -59,6 +59,15 @@ pub struct PollableFilter {
 impl NewFilterRequest {
     pub fn parse(params: &Option<Vec<serde_json::Value>>) -> Result<Self, RpcErr> {
         let filter = LogsFilter::parse(params)?;
+        // EIP-234 defines `blockHash` for eth_newFilter too, but the only thing
+        // it does with such a filter is answer eth_getFilterLogs, which we don't
+        // implement. For eth_getFilterChanges, a moving range by definition, even
+        // geth ignores the hash. Reject it instead of accepting and ignoring.
+        if filter.block_hash.is_some() {
+            return Err(RpcErr::BadParams(
+                "`blockHash` is not a valid filter for eth_newFilter".to_string(),
+            ));
+        }
         Ok(NewFilterRequest {
             request_data: filter,
         })
@@ -263,14 +272,13 @@ mod tests {
             logs::{AddressFilter, LogsFilter, TopicFilter},
         },
         rpc::{FILTER_DURATION, map_http_requests},
-        utils::test_utils::{self, default_context_with_storage, start_test_api},
+        test_utils::{TEST_GENESIS, default_context_with_storage, start_test_api},
     };
     use crate::{types::block_identifier::BlockIdentifier, utils::RpcRequest};
     use ethrex_common::types::Genesis;
     use ethrex_storage::{EngineType, Store};
 
     use serde_json::{Value, json};
-    use test_utils::TEST_GENESIS;
 
     #[tokio::test]
     async fn filter_request_smoke_test_valid_params() {
@@ -478,6 +486,7 @@ mod tests {
                     filter_data: LogsFilter {
                         from_block: BlockIdentifier::Number(1),
                         to_block: BlockIdentifier::Number(2),
+                        block_hash: None,
                         address_filters: None,
                         topics: vec![],
                     },

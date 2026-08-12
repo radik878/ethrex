@@ -3,11 +3,10 @@ use bytes::Bytes;
 use directories::ProjectDirs;
 use ethrex_common::types::{Block, Genesis};
 use ethrex_p2p::{
-    discv4::peer_table::PeerTable,
+    peer_table::{PeerTable, PeerTableServerProtocol as _},
     sync::SyncMode,
     types::{Node, NodeRecord},
 };
-use ethrex_rlp::decode::RLPDecode;
 use hex::FromHexError;
 use secp256k1::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -26,7 +25,7 @@ pub struct NodeConfigFile {
 }
 
 impl NodeConfigFile {
-    pub async fn new(mut peer_table: PeerTable, node_record: NodeRecord) -> Self {
+    pub async fn new(peer_table: PeerTable, node_record: NodeRecord) -> Self {
         let connected_peers = peer_table.get_connected_nodes().await.unwrap_or(Vec::new());
 
         NodeConfigFile {
@@ -46,6 +45,12 @@ pub fn read_jwtsecret_file(jwt_secret_path: &str) -> Bytes {
 pub fn write_jwtsecret_file(jwt_secret_path: &str) -> Bytes {
     info!("JWT secret not found in the provided path, generating JWT secret");
     let secret = generate_jwt_secret();
+
+    // Ensure the directory exists
+    if let Some(parent_dir) = Path::new(jwt_secret_path).parent() {
+        std::fs::create_dir_all(parent_dir).expect("Failed to create parent dir");
+    }
+
     std::fs::write(jwt_secret_path, &secret).expect("Unable to write JWT secret file");
     hex::decode(secret)
         .map(Bytes::from)
@@ -65,11 +70,21 @@ pub fn read_chain_file(chain_rlp_path: &str) -> Vec<Block> {
     decode::chain_file(chain_file).expect("Failed to decode chain rlp file")
 }
 
-pub fn read_block_file(block_file_path: &str) -> Block {
-    let encoded_block = std::fs::read(block_file_path)
-        .unwrap_or_else(|_| panic!("Failed to read block file with path {block_file_path}"));
-    Block::decode(&encoded_block)
-        .unwrap_or_else(|_| panic!("Failed to decode block file {block_file_path}"))
+pub fn parse_http_namespace(s: &str) -> eyre::Result<ethrex_rpc::RpcNamespace> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(eyre::eyre!("empty namespace in --http.api"));
+    }
+    if trimmed.eq_ignore_ascii_case("engine") {
+        return Err(eyre::eyre!(
+            "`engine` cannot be enabled on --http.api; it is served on the authenticated RPC port"
+        ));
+    }
+    ethrex_rpc::RpcNamespace::from_prefix(&trimmed.to_ascii_lowercase()).ok_or_else(|| {
+        eyre::eyre!(
+            "unknown RPC namespace {trimmed:?}; expected one of eth, net, web3, debug, admin, txpool, testing"
+        )
+    })
 }
 
 pub fn parse_sync_mode(s: &str) -> eyre::Result<SyncMode> {
@@ -115,7 +130,7 @@ pub fn init_datadir(datadir: &Path) {
     }
 }
 
-pub async fn store_node_config_file(config: NodeConfigFile, file_path: PathBuf) {
+pub fn store_node_config_file(config: NodeConfigFile, file_path: PathBuf) {
     let json = match serde_json::to_string(&config) {
         Ok(json) => json,
         Err(e) => {
@@ -160,17 +175,33 @@ pub fn parse_hex(s: &str) -> eyre::Result<Bytes, FromHexError> {
     }
 }
 
-/// Returns a detailed client version string with git info.
-pub fn get_client_version() -> String {
-    format!(
-        "{}/v{}-{}-{}/{}/rustc-v{}",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION"),
-        env!("VERGEN_GIT_BRANCH"),
-        env!("VERGEN_GIT_SHA"),
-        env!("VERGEN_RUSTC_HOST_TRIPLE"),
-        env!("VERGEN_RUSTC_SEMVER")
+/// The release channel reported in the client version. The published release
+/// image sets `ETHREX_CHANNEL=stable` on its config at promotion time; otherwise
+/// this falls back to the value baked at build time — the git branch, or the RC
+/// suffix (e.g. `rc.1`) for release-tag builds. Promotion only stamps the env on
+/// the image config, so the tested binary itself is byte-for-byte unchanged.
+pub fn get_channel() -> String {
+    std::env::var("ETHREX_CHANNEL")
+        .ok()
+        .filter(|channel| !channel.is_empty())
+        .unwrap_or_else(|| env!("VERGEN_GIT_BRANCH").to_string())
+}
+
+/// Returns a detailed client version struct with git info.
+pub fn get_client_version() -> ethrex_rpc::ClientVersion {
+    ethrex_rpc::ClientVersion::new(
+        env!("CARGO_PKG_NAME").to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+        get_channel(),
+        env!("VERGEN_GIT_SHA").to_string(),
+        env!("VERGEN_RUSTC_HOST_TRIPLE").to_string(),
+        env!("VERGEN_RUSTC_SEMVER").to_string(),
     )
+}
+
+/// Returns a detailed client version string with git info (for clap attributes).
+pub fn get_client_version_string() -> String {
+    get_client_version().to_string()
 }
 
 /// Returns a minimal client version string without git info.
@@ -179,6 +210,8 @@ pub fn get_minimal_client_version() -> String {
 }
 
 pub fn display_chain_initialization(genesis: &Genesis) {
+    const BANNER: &str = include_str!("banner.txt");
+    info!("\n{BANNER}");
     let border = "═".repeat(70);
 
     info!("{border}");
@@ -193,4 +226,8 @@ pub fn display_chain_initialization(genesis: &Genesis) {
     let hash = genesis.get_block().hash();
     info!("Genesis Block Hash: {hash:x}");
     info!("{border}");
+}
+
+pub fn is_memory_datadir(datadir: &Path) -> bool {
+    datadir.ends_with("memory")
 }

@@ -2,17 +2,14 @@ use super::{
     BASE_FEE_MAX_CHANGE_DENOMINATOR, ChainConfig, Fork, ForkBlobSchedule,
     GAS_LIMIT_ADJUSTMENT_FACTOR, GAS_LIMIT_MINIMUM, INITIAL_BASE_FEE,
 };
-use crate::utils::keccak;
 use crate::{
     Address, H256, U256,
-    constants::{
-        BLOB_BASE_COST, DEFAULT_OMMERS_HASH, EMPTY_WITHDRAWALS_HASH, GAS_PER_BLOB,
-        MIN_BASE_FEE_PER_BLOB_GAS,
-    },
+    constants::{BLOB_BASE_COST, DEFAULT_OMMERS_HASH, GAS_PER_BLOB, MIN_BASE_FEE_PER_BLOB_GAS},
     types::{Receipt, Transaction},
 };
 use bytes::Bytes;
 use ethereum_types::Bloom;
+use ethrex_crypto::{Crypto, CryptoError, NativeCrypto};
 use ethrex_rlp::{
     decode::RLPDecode,
     encode::RLPEncode,
@@ -20,6 +17,7 @@ use ethrex_rlp::{
     structs::{Decoder, Encoder},
 };
 use ethrex_trie::Trie;
+#[cfg(all(not(feature = "eip-8025"), feature = "rayon"))]
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rkyv::{Archive, Deserialize as RDeserialize, Serialize as RSerialize};
 use serde::{Deserialize, Serialize};
@@ -29,6 +27,9 @@ use std::cmp::{Ordering, max};
 pub type BlockNumber = u64;
 pub type BlockHash = H256;
 
+#[cfg(all(feature = "eip-8025", target_arch = "riscv64"))]
+use super::eip8025_cell::OnceCell;
+#[cfg(not(all(feature = "eip-8025", target_arch = "riscv64")))]
 use once_cell::sync::OnceCell;
 
 #[derive(
@@ -79,9 +80,7 @@ impl RLPDecode for Block {
 }
 
 /// Header part of a block on the chain.
-#[derive(
-    Clone, Debug, PartialEq, Eq, Serialize, Default, Deserialize, RSerialize, RDeserialize, Archive,
-)]
+#[derive(Clone, Debug, Serialize, Default, Deserialize, RSerialize, RDeserialize, Archive, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockHeader {
     #[serde(skip)]
@@ -143,6 +142,81 @@ pub struct BlockHeader {
     #[serde(skip_serializing_if = "Option::is_none", default = "Option::default")]
     #[rkyv(with=crate::rkyv_utils::OptionH256Wrapper)]
     pub requests_hash: Option<H256>,
+    // Amsterdam fork fields (EIP-7928)
+    #[serde(skip_serializing_if = "Option::is_none", default = "Option::default")]
+    #[rkyv(with=crate::rkyv_utils::OptionH256Wrapper)]
+    pub block_access_list_hash: Option<H256>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "crate::serde_utils::u64::hex_str_opt",
+        default = "Option::default"
+    )]
+    pub slot_number: Option<u64>,
+    // LStar fork fields (EIP-8079)
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "crate::serde_utils::u64::hex_str_opt",
+        default = "Option::default"
+    )]
+    pub burned_fees: Option<u64>,
+}
+
+// Needs a explicit impl due to the hash OnceLock.
+impl PartialEq for BlockHeader {
+    fn eq(&self, other: &Self) -> bool {
+        let BlockHeader {
+            hash: _,
+            parent_hash,
+            ommers_hash,
+            coinbase,
+            state_root,
+            transactions_root,
+            receipts_root,
+            logs_bloom,
+            difficulty,
+            number,
+            gas_limit,
+            gas_used,
+            timestamp,
+            extra_data,
+            prev_randao,
+            nonce,
+            base_fee_per_gas,
+            withdrawals_root,
+            blob_gas_used,
+            excess_blob_gas,
+            parent_beacon_block_root,
+            requests_hash,
+            block_access_list_hash,
+            slot_number,
+            burned_fees,
+        } = self;
+
+        parent_hash == &other.parent_hash
+            && number == &other.number
+            && timestamp == &other.timestamp
+            && nonce == &other.nonce
+            && gas_used == &other.gas_used
+            && gas_limit == &other.gas_limit
+            && base_fee_per_gas == &other.base_fee_per_gas
+            && blob_gas_used == &other.blob_gas_used
+            && excess_blob_gas == &other.excess_blob_gas
+            && parent_beacon_block_root == &other.parent_beacon_block_root
+            && prev_randao == &other.prev_randao
+            && coinbase == &other.coinbase
+            && state_root == &other.state_root
+            && transactions_root == &other.transactions_root
+            && receipts_root == &other.receipts_root
+            && withdrawals_root == &other.withdrawals_root
+            && difficulty == &other.difficulty
+            && ommers_hash == &other.ommers_hash
+            && requests_hash == &other.requests_hash
+            && block_access_list_hash == &other.block_access_list_hash
+            && slot_number == &other.slot_number
+            && burned_fees == &other.burned_fees
+            && logs_bloom == &other.logs_bloom
+            && extra_data == &other.extra_data
+    }
 }
 
 impl RLPEncode for BlockHeader {
@@ -169,6 +243,9 @@ impl RLPEncode for BlockHeader {
             .encode_optional_field(&self.excess_blob_gas)
             .encode_optional_field(&self.parent_beacon_block_root)
             .encode_optional_field(&self.requests_hash)
+            .encode_optional_field(&self.block_access_list_hash)
+            .encode_optional_field(&self.slot_number)
+            .encode_optional_field(&self.burned_fees)
             .finish();
     }
 }
@@ -198,6 +275,9 @@ impl RLPDecode for BlockHeader {
         let (excess_blob_gas, decoder) = decoder.decode_optional_field();
         let (parent_beacon_block_root, decoder) = decoder.decode_optional_field();
         let (requests_hash, decoder) = decoder.decode_optional_field();
+        let (block_access_list_hash, decoder) = decoder.decode_optional_field();
+        let (slot_number, decoder) = decoder.decode_optional_field();
+        let (burned_fees, decoder) = decoder.decode_optional_field();
 
         Ok((
             BlockHeader {
@@ -223,6 +303,9 @@ impl RLPDecode for BlockHeader {
                 excess_blob_gas,
                 parent_beacon_block_root,
                 requests_hash,
+                block_access_list_hash,
+                slot_number,
+                burned_fees,
             },
             decoder.finish()?,
         ))
@@ -252,41 +335,72 @@ impl BlockBody {
 
     pub fn get_transactions_with_sender(
         &self,
-    ) -> Result<Vec<(&Transaction, Address)>, secp256k1::Error> {
+        crypto: &dyn Crypto,
+    ) -> Result<Vec<(&Transaction, Address)>, CryptoError> {
         // Recovering addresses is computationally expensive.
         // Computing them in parallel greatly reduces execution time.
-        self.transactions
+        // In eip-8025 builds, use sequential iteration
+        #[cfg(all(feature = "rayon", not(feature = "eip-8025")))]
+        return self
+            .transactions
             .par_iter()
-            .map(|tx| Ok((tx, tx.sender()?)))
-            .collect::<Result<Vec<(&Transaction, Address)>, secp256k1::Error>>()
+            .map(|tx| Ok((tx, tx.sender(crypto)?)))
+            .collect::<Result<Vec<(&Transaction, Address)>, CryptoError>>();
+
+        #[cfg(any(feature = "eip-8025", not(feature = "rayon")))]
+        self.transactions
+            .iter()
+            .map(|tx| Ok((tx, tx.sender(crypto)?)))
+            .collect::<Result<Vec<(&Transaction, Address)>, CryptoError>>()
     }
 }
 
-pub fn compute_transactions_root(transactions: &[Transaction]) -> H256 {
+pub fn compute_transactions_root(transactions: &[Transaction], crypto: &dyn Crypto) -> H256 {
     let iter = transactions.iter().enumerate().map(|(idx, tx)| {
         // Key: RLP(tx_index)
         // Value: tx_type || RLP(tx)  if tx_type != 0
         //                   RLP(tx)  else
         (idx.encode_to_vec(), tx.encode_canonical_to_vec())
     });
-    Trie::compute_hash_from_unsorted_iter(iter)
+    Trie::compute_hash_from_unsorted_iter(iter, crypto)
 }
 
-pub fn compute_receipts_root(receipts: &[Receipt]) -> H256 {
+pub fn compute_receipts_root(receipts: &[Receipt], crypto: &dyn Crypto) -> H256 {
     let iter = receipts
         .iter()
         .enumerate()
-        .map(|(idx, receipt)| (idx.encode_to_vec(), receipt.encode_inner_with_bloom()));
-    Trie::compute_hash_from_unsorted_iter(iter)
+        .map(|(idx, receipt)| (idx.encode_to_vec(), receipt.encode_inner_with_bloom(crypto)));
+    Trie::compute_hash_from_unsorted_iter(iter, crypto)
+}
+
+/// Computes the receipts root and the aggregate header `logs_bloom` in a single pass,
+/// hashing each receipt's bloom only once (it feeds both the receipts trie and the
+/// OR-ed header bloom). Validation paths need both, so this avoids the duplicate
+/// `bloom_from_logs` keccak work — relevant in the zkVM guest where it is cycle-counted.
+pub fn compute_receipts_root_and_logs_bloom(
+    receipts: &[Receipt],
+    crypto: &dyn Crypto,
+) -> (H256, Bloom) {
+    let mut logs_bloom = Bloom::zero();
+    let iter = receipts.iter().enumerate().map(|(idx, receipt)| {
+        let bloom = crate::types::bloom_from_logs(&receipt.logs, crypto);
+        logs_bloom |= bloom;
+        (
+            idx.encode_to_vec(),
+            receipt.encode_inner_with_precomputed_bloom(bloom),
+        )
+    });
+    let receipts_root = Trie::compute_hash_from_unsorted_iter(iter, crypto);
+    (receipts_root, logs_bloom)
 }
 
 // See [EIP-4895](https://eips.ethereum.org/EIPS/eip-4895)
-pub fn compute_withdrawals_root(withdrawals: &[Withdrawal]) -> H256 {
+pub fn compute_withdrawals_root(withdrawals: &[Withdrawal], crypto: &dyn Crypto) -> H256 {
     let iter = withdrawals
         .iter()
         .enumerate()
         .map(|(idx, withdrawal)| (idx.encode_to_vec(), withdrawal.encode_to_vec()));
-    Trie::compute_hash_from_unsorted_iter(iter)
+    Trie::compute_hash_from_unsorted_iter(iter, crypto)
 }
 
 impl RLPEncode for BlockBody {
@@ -317,14 +431,29 @@ impl RLPDecode for BlockBody {
 }
 
 impl BlockHeader {
-    fn compute_block_hash(&self) -> H256 {
+    pub fn compute_block_hash(&self, crypto: &dyn Crypto) -> H256 {
         let mut buf = vec![];
         self.encode(&mut buf);
-        keccak(buf)
+        H256(crypto.keccak256(&buf))
     }
 
     pub fn hash(&self) -> H256 {
-        *self.hash.get_or_init(|| self.compute_block_hash())
+        *self
+            .hash
+            .get_or_init(|| self.compute_block_hash(&NativeCrypto))
+    }
+
+    /// Returns `self` with `burned_fees` set and the hash cache cleared.
+    ///
+    /// After `execute_blocks`, the header's `OnceCell` may already hold a stale
+    /// hash that was computed before `burned_fees` was known (e.g. during
+    /// `initialize_block_header_hashes`).  Taking ownership and clearing the
+    /// cache guarantees that the next call to `hash()` reflects the injected
+    /// value — without any extra `once_cell` dependency at the call site.
+    pub fn into_with_burned_fees(mut self, burned_fees: Option<u64>) -> Self {
+        self.burned_fees = burned_fees;
+        let _ = self.hash.take(); // clear stale cached hash
+        self
     }
 }
 
@@ -384,70 +513,83 @@ fn check_gas_limit(gas_limit: u64, parent_gas_limit: u64) -> bool {
 
 /// Calculates the base fee per blob gas for the current block based on
 /// it's parent excess blob gas and the update fraction, which depends on the fork.
-pub fn calculate_base_fee_per_blob_gas(parent_excess_blob_gas: u64, update_fraction: u64) -> u64 {
+pub fn calculate_base_fee_per_blob_gas(parent_excess_blob_gas: u64, update_fraction: u64) -> U256 {
     if update_fraction == 0 {
-        return 0;
+        return U256::zero();
     }
+
     fake_exponential(
-        MIN_BASE_FEE_PER_BLOB_GAS,
-        parent_excess_blob_gas,
+        U256::from(MIN_BASE_FEE_PER_BLOB_GAS),
+        U256::from(parent_excess_blob_gas),
         update_fraction,
     )
+    .unwrap_or_default()
 }
 
-// Defined in [EIP-4844](https://eips.ethereum.org/EIPS/eip-4844)
-pub fn fake_exponential(factor: u64, numerator: u64, denominator: u64) -> u64 {
-    let mut i = 1;
-    let mut output = 0;
-    let mut numerator_accum = factor * denominator;
-    while numerator_accum > 0 {
-        output += numerator_accum;
-        numerator_accum = numerator_accum * numerator / (denominator * i);
-        i += 1;
-    }
-    output / denominator
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum FakeExponentialError {
-    #[error("Denominator cannot be zero.")]
-    DenominatorIsZero,
-    #[error("Checked div failed is None.")]
-    CheckedDiv,
-    #[error("Checked mul failed is None.")]
-    CheckedMul,
-}
-
-pub fn fake_exponential_checked(
-    factor: u64,
-    numerator: u64,
+/// Approximates factor * e ** (numerator / denominator) using Taylor expansion
+/// https://eips.ethereum.org/EIPS/eip-4844#helpers
+/// 400_000_000 numerator is the limit for this operation to work with U256,
+/// it will overflow with a larger numerator
+pub fn fake_exponential(
+    factor: U256,
+    numerator: U256,
     denominator: u64,
-) -> Result<u64, FakeExponentialError> {
-    let mut i = 1_u64;
-    let mut output = 0_u64;
-    let mut numerator_accum = factor * denominator;
+) -> Result<U256, FakeExponentialError> {
     if denominator == 0 {
         return Err(FakeExponentialError::DenominatorIsZero);
     }
 
-    while numerator_accum > 0 {
-        output = output.saturating_add(numerator_accum);
-
-        let denominator_i = denominator
-            .checked_mul(i)
-            .ok_or(FakeExponentialError::CheckedMul)?;
-
-        if denominator_i == 0 {
-            return Err(FakeExponentialError::DenominatorIsZero);
-        }
-
-        numerator_accum = numerator_accum * numerator / denominator_i;
-        i += 1;
+    if numerator.is_zero() {
+        return Ok(factor);
     }
 
-    output
-        .checked_div(denominator)
-        .ok_or(FakeExponentialError::CheckedDiv)
+    let mut output: U256 = U256::zero();
+    let denominator_u256: U256 = denominator.into();
+
+    // Initial multiplication: factor * denominator
+    let mut numerator_accum = factor
+        .checked_mul(denominator_u256)
+        .ok_or(FakeExponentialError::CheckedMul)?;
+
+    let mut denominator_by_i = denominator_u256;
+
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "division can't overflow since denominator is not 0"
+    )]
+    {
+        while !numerator_accum.is_zero() {
+            // Safe addition to output
+            output = output
+                .checked_add(numerator_accum)
+                .ok_or(FakeExponentialError::CheckedAdd)?;
+
+            // Safe multiplication and division within loop
+            numerator_accum = numerator_accum
+                .checked_mul(numerator)
+                .ok_or(FakeExponentialError::CheckedMul)?
+                / denominator_by_i;
+
+            // denominator comes from a u64 value, will never overflow before other variables.
+            denominator_by_i += denominator_u256;
+        }
+
+        output
+            .checked_div(denominator.into())
+            .ok_or(FakeExponentialError::CheckedDiv)
+    }
+}
+
+#[derive(Debug, thiserror::Error, Serialize, Clone, PartialEq, Deserialize, Eq)]
+pub enum FakeExponentialError {
+    #[error("FakeExponentialError: Denominator cannot be zero.")]
+    DenominatorIsZero,
+    #[error("FakeExponentialError: Checked div failed is None.")]
+    CheckedDiv,
+    #[error("FakeExponentialError: Checked mul failed is None.")]
+    CheckedMul,
+    #[error("FakeExponentialError: Checked add failed is None.")]
+    CheckedAdd,
 }
 
 // Calculates the base fee for the current block based on its gas_limit and parent's gas and fee
@@ -503,6 +645,8 @@ pub fn calculate_base_fee_per_gas(
 pub enum InvalidBlockHeaderError {
     #[error("Gas used is greater than gas limit")]
     GasUsedGreaterThanGasLimit,
+    #[error("Gas limit changed more than allowed from the parent")]
+    GasLimitTooFarFromParent,
     #[error("Base fee per gas is incorrect")]
     BaseFeePerGasIncorrect,
     #[error("Timestamp is not greater than parent timestamp")]
@@ -539,6 +683,14 @@ pub enum InvalidBlockHeaderError {
     ParentBeaconBlockRootPresent,
     #[error("Requests hash is present")]
     RequestsHashPresent,
+    #[error("Block access list hash is not present")]
+    BlockAccessListHashNotPresent,
+    #[error("Block access list hash is present")]
+    BlockAccessListHashPresent,
+    #[error("Slot number is not present")]
+    SlotNumberNotPresent,
+    #[error("Slot number is present")]
+    SlotNumberPresent,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -570,7 +722,7 @@ pub fn validate_block_header(
     ) {
         base_fee
     } else {
-        return Err(InvalidBlockHeaderError::BaseFeePerGasIncorrect);
+        return Err(InvalidBlockHeaderError::GasLimitTooFarFromParent);
     };
 
     if expected_base_fee_per_gas != header.base_fee_per_gas.unwrap_or(INITIAL_BASE_FEE) {
@@ -612,11 +764,12 @@ pub fn validate_block_header(
 pub fn validate_block_body(
     block_header: &BlockHeader,
     block_body: &BlockBody,
+    crypto: &dyn Crypto,
 ) -> Result<(), InvalidBlockBodyError> {
     // Validates that:
     //  - Transactions root and withdrawals root matches with the header
     //  - Ommers is empty -> https://eips.ethereum.org/EIPS/eip-3675
-    let computed_tx_root = compute_transactions_root(&block_body.transactions);
+    let computed_tx_root = compute_transactions_root(&block_body.transactions, crypto);
 
     if block_header.transactions_root != computed_tx_root {
         return Err(InvalidBlockBodyError::TransactionsRootNotMatch);
@@ -628,16 +781,15 @@ pub fn validate_block_body(
 
     match (block_header.withdrawals_root, &block_body.withdrawals) {
         (Some(withdrawals_root), Some(withdrawals)) => {
-            let computed_withdrawals_root = compute_withdrawals_root(withdrawals);
+            let computed_withdrawals_root = compute_withdrawals_root(withdrawals, crypto);
             if withdrawals_root != computed_withdrawals_root {
                 return Err(InvalidBlockBodyError::WithdrawalsRootNotMatch);
             }
         }
-        (Some(withdrawals_root), None) => {
-            if withdrawals_root != *EMPTY_WITHDRAWALS_HASH {
-                return Err(InvalidBlockBodyError::WithdrawalsRootNotMatch);
-            }
-        }
+        // Post-Shanghai, the withdrawals field must be present in the body even when
+        // empty. A body that omits it is malformed, regardless of the header's
+        // withdrawals_root — geth ("missing withdrawals in block body"), reth,
+        // nethermind, erigon and besu all reject this shape.
         (None, None) => {}
         _ => return Err(InvalidBlockBodyError::WithdrawalsRootNotMatch),
     }
@@ -666,6 +818,24 @@ pub fn validate_prague_header_fields(
     if header.requests_hash.is_none() {
         return Err(InvalidBlockHeaderError::RequestsHashNotPresent);
     }
+    if chain_config.is_amsterdam_activated(header.timestamp) {
+        // EIP-7928: BAL hash and EIP-7843: slot_number are both mandatory
+        // trailing header fields on Amsterdam. A header omitting either is
+        // schema-invalid and must be rejected to match conformant clients.
+        if header.block_access_list_hash.is_none() {
+            return Err(InvalidBlockHeaderError::BlockAccessListHashNotPresent);
+        }
+        if header.slot_number.is_none() {
+            return Err(InvalidBlockHeaderError::SlotNumberNotPresent);
+        }
+    } else {
+        if header.block_access_list_hash.is_some() {
+            return Err(InvalidBlockHeaderError::BlockAccessListHashPresent);
+        }
+        if header.slot_number.is_some() {
+            return Err(InvalidBlockHeaderError::SlotNumberPresent);
+        }
+    }
     Ok(())
 }
 
@@ -689,6 +859,12 @@ pub fn validate_cancun_header_fields(
     if header.requests_hash.is_some() {
         return Err(InvalidBlockHeaderError::RequestsHashPresent);
     }
+    if header.block_access_list_hash.is_some() {
+        return Err(InvalidBlockHeaderError::BlockAccessListHashPresent);
+    }
+    if header.slot_number.is_some() {
+        return Err(InvalidBlockHeaderError::SlotNumberPresent);
+    }
     Ok(())
 }
 
@@ -708,6 +884,12 @@ pub fn validate_pre_cancun_header_fields(
     }
     if header.requests_hash.is_some() {
         return Err(InvalidBlockHeaderError::RequestsHashPresent);
+    }
+    if header.block_access_list_hash.is_some() {
+        return Err(InvalidBlockHeaderError::BlockAccessListHashPresent);
+    }
+    if header.slot_number.is_some() {
+        return Err(InvalidBlockHeaderError::SlotNumberPresent);
     }
     Ok(())
 }
@@ -744,8 +926,8 @@ pub fn calc_excess_blob_gas(parent: &BlockHeader, schedule: ForkBlobSchedule, fo
     }
 
     if fork >= Fork::Osaka
-        && BLOB_BASE_COST * parent_base_fee_per_gas
-            > (GAS_PER_BLOB as u64)
+        && U256::from(BLOB_BASE_COST) * U256::from(parent_base_fee_per_gas)
+            > (U256::from(GAS_PER_BLOB))
                 * calculate_base_fee_per_blob_gas(
                     parent_excess_blob_gas,
                     schedule.base_fee_update_fraction,
@@ -762,8 +944,8 @@ pub fn calc_excess_blob_gas(parent: &BlockHeader, schedule: ForkBlobSchedule, fo
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::constants::EMPTY_KECCACK_HASH;
-    use crate::types::ELASTICITY_MULTIPLIER;
+    use crate::constants::EMPTY_KECCAK_HASH;
+    use crate::types::{BLOB_BASE_FEE_UPDATE_FRACTION, ELASTICITY_MULTIPLIER};
     use ethereum_types::H160;
     use hex_literal::hex;
     use std::str::FromStr;
@@ -789,7 +971,7 @@ mod test {
         let expected_root = H256::from_slice(&hex!(
             "48a703da164234812273ea083e4ec3d09d028300cd325b46a6a75402e5a7ab95"
         ));
-        let root = compute_withdrawals_root(&withdrawals);
+        let root = compute_withdrawals_root(&withdrawals, &ethrex_crypto::NativeCrypto);
         assert_eq!(root, expected_root);
     }
 
@@ -836,7 +1018,7 @@ mod test {
             blob_gas_used: Some(0x00),
             excess_blob_gas: Some(0x00),
             parent_beacon_block_root: Some(H256::zero()),
-            requests_hash: Some(*EMPTY_KECCACK_HASH),
+            requests_hash: Some(*EMPTY_KECCAK_HASH),
             ..Default::default()
         };
         let block = BlockHeader {
@@ -880,10 +1062,12 @@ mod test {
             blob_gas_used: Some(0x00),
             excess_blob_gas: Some(0x00),
             parent_beacon_block_root: Some(H256::zero()),
-            requests_hash: Some(*EMPTY_KECCACK_HASH),
+            requests_hash: Some(*EMPTY_KECCAK_HASH),
             ..Default::default()
         };
-        assert!(validate_block_header(&block, &parent_block, ELASTICITY_MULTIPLIER).is_ok())
+        assert!(validate_block_header(&block, &parent_block, ELASTICITY_MULTIPLIER).is_ok());
+        assert_eq!(parent_block.encode_to_vec().len(), parent_block.length());
+        assert_eq!(block.encode_to_vec().len(), block.length());
     }
 
     #[test]
@@ -901,7 +1085,8 @@ mod test {
                     .unwrap()
             })
             .collect();
-        let transactions_root = compute_transactions_root(&transactions);
+        let transactions_root =
+            compute_transactions_root(&transactions, &ethrex_crypto::NativeCrypto);
         let expected_root = H256::from_slice(
             &hex::decode("adf0387d2303fe80aeca23bf6828c979b44d8a8fe4a1ba1d3511bc1567ca80de")
                 .unwrap(),
@@ -982,5 +1167,190 @@ mod test {
 
         let res = calc_excess_blob_gas(&parent, schedule, fork);
         assert_eq!(res, 3538944)
+    }
+
+    #[test]
+    fn test_fake_exponential_overflow() {
+        // With u64 this overflows
+        assert!(fake_exponential(57532635.into(), 3145728.into(), 3338477).is_ok());
+    }
+
+    #[test]
+    fn test_fake_exponential_bounds_overflow() {
+        // Making sure the limit we state in the documentation of 400_000_000 works
+        let thing = fake_exponential(
+            MIN_BASE_FEE_PER_BLOB_GAS.into(),
+            400_000_000.into(),
+            BLOB_BASE_FEE_UPDATE_FRACTION,
+        );
+        // With u64 this overflows
+        assert!(thing.is_ok());
+    }
+
+    #[test]
+    fn burned_fees_header_roundtrip_and_hash() {
+        // For a correct round-trip, all preceding optional fields must be Some so the
+        // positional/trailing RLP decoder can attribute burned_fees correctly.
+        // This mirrors a real LStar-era block header.
+        let h = BlockHeader {
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(H256::zero()),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(H256::zero()),
+            requests_hash: Some(H256::zero()),
+            block_access_list_hash: Some(H256::zero()),
+            slot_number: Some(1),
+            burned_fees: Some(12345),
+            ..Default::default()
+        };
+        let encoded = h.encode_to_vec();
+        let decoded = BlockHeader::decode(&encoded).expect("decode");
+        assert_eq!(decoded.burned_fees, Some(12345));
+        // None round-trips as None (pre-LStar).
+        let h_none = BlockHeader {
+            burned_fees: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            BlockHeader::decode(&h_none.encode_to_vec())
+                .unwrap()
+                .burned_fees,
+            None
+        );
+        // burned_fees participates in the block hash: same base state, only burned_fees differs.
+        let h_with = BlockHeader {
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(H256::zero()),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(H256::zero()),
+            requests_hash: Some(H256::zero()),
+            block_access_list_hash: Some(H256::zero()),
+            slot_number: Some(1),
+            burned_fees: Some(12345),
+            ..Default::default()
+        };
+        let h_without = BlockHeader {
+            base_fee_per_gas: Some(7),
+            withdrawals_root: Some(H256::zero()),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(H256::zero()),
+            requests_hash: Some(H256::zero()),
+            block_access_list_hash: Some(H256::zero()),
+            slot_number: Some(1),
+            burned_fees: None,
+            ..Default::default()
+        };
+        assert_ne!(h_with.hash(), h_without.hash());
+    }
+
+    /// Verify that `into_with_burned_fees` clears the OnceCell so the resulting
+    /// hash reflects the injected value and not any previously cached hash.
+    ///
+    /// This is the TDD anchor for the Task-4 verify-flow reorder: after
+    /// `execute_blocks` caches the block hash (burned_fees=None), we must be
+    /// able to inject the recomputed `burned_fees` and still get the correct hash.
+    #[test]
+    fn into_with_burned_fees_clears_stale_cache() {
+        use crate::NativeCrypto;
+
+        // Build a default header (burned_fees = None).
+        let header_none = BlockHeader::default();
+
+        // Force the hash cache to populate with burned_fees=None value.
+        let hash_stale = header_none.hash();
+
+        // Build a reference header with burned_fees=Some(42) from scratch (fresh OnceCell).
+        let header_some_fresh = BlockHeader {
+            burned_fees: Some(42),
+            ..BlockHeader::default()
+        };
+        let hash_expected = header_some_fresh.compute_block_hash(&NativeCrypto);
+
+        // The two hashes must differ — burned_fees is RLP-encoded in the header.
+        assert_ne!(
+            hash_stale, hash_expected,
+            "burned_fees=None and burned_fees=Some(42) must produce different block hashes"
+        );
+
+        // Now inject Some(42) via into_with_burned_fees, starting from the stale-cached header.
+        let fresh_header = header_none.into_with_burned_fees(Some(42));
+        let hash_fresh = fresh_header.hash();
+
+        // Must match the reference hash, NOT the stale one.
+        assert_eq!(
+            hash_fresh, hash_expected,
+            "into_with_burned_fees must yield a hash identical to building a fresh header with the same burned_fees"
+        );
+        assert_ne!(
+            hash_fresh, hash_stale,
+            "OnceCell must have been cleared: fresh hash must differ from the stale cached hash"
+        );
+    }
+
+    /// Verify the Amsterdam (pre-LStar) no-op: injecting None into a header
+    /// whose hash was cached with burned_fees=None yields the same hash.
+    ///
+    /// This is the primary correctness requirement for Task 4: the reordered
+    /// verify-flow must not regress the current Amsterdam path.
+    #[test]
+    fn into_with_burned_fees_none_is_idempotent() {
+        let header = BlockHeader::default();
+        let hash_before = header.hash(); // populate cache with burned_fees=None
+
+        // Inject None (Amsterdam: burned_fees is None both before and after execution).
+        let header_after = header.into_with_burned_fees(None);
+        let hash_after = header_after.hash();
+
+        assert_eq!(
+            hash_before, hash_after,
+            "injecting None must not change the block hash (Amsterdam no-op)"
+        );
+    }
+
+    #[test]
+    fn test_validate_block_body_rejects_missing_withdrawals_field() {
+        use crate::constants::EMPTY_WITHDRAWALS_HASH;
+
+        let crypto = NativeCrypto;
+        let header = BlockHeader {
+            transactions_root: compute_transactions_root(&[], &crypto),
+            withdrawals_root: Some(*EMPTY_WITHDRAWALS_HASH),
+            ..Default::default()
+        };
+
+        // A post-Shanghai body that OMITS the withdrawals field is malformed and
+        // must be rejected even when the header commits to the empty-withdrawals
+        // root (geth: "missing withdrawals in block body"; reth, nethermind,
+        // erigon and besu reject this shape as well).
+        let body_missing = BlockBody {
+            withdrawals: None,
+            ..BlockBody::empty()
+        };
+        assert!(matches!(
+            validate_block_body(&header, &body_missing, &crypto),
+            Err(InvalidBlockBodyError::WithdrawalsRootNotMatch)
+        ));
+
+        // An explicit empty withdrawals list is valid for the same header.
+        assert!(validate_block_body(&header, &BlockBody::empty(), &crypto).is_ok());
+
+        // A withdrawals field without a header root (pre-Shanghai shape) is rejected.
+        let pre_shanghai_header = BlockHeader {
+            transactions_root: compute_transactions_root(&[], &crypto),
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_block_body(&pre_shanghai_header, &BlockBody::empty(), &crypto),
+            Err(InvalidBlockBodyError::WithdrawalsRootNotMatch)
+        ));
+        // Neither field present is valid.
+        let body_no_withdrawals = BlockBody {
+            withdrawals: None,
+            ..BlockBody::empty()
+        };
+        assert!(validate_block_body(&pre_shanghai_header, &body_no_withdrawals, &crypto).is_ok());
     }
 }

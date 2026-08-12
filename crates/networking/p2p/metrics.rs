@@ -57,12 +57,12 @@ pub struct Metrics {
     /* Snap Sync */
     // Common
     pub sync_head_block: AtomicU64,
+    pub pivot_timestamp: AtomicU64,
     pub sync_head_hash: Arc<Mutex<H256>>,
     pub current_step: Arc<CurrentStep>,
 
     // Headers
-    pub headers_to_download: AtomicU64,
-    pub downloaded_headers: AtomicU64,
+    pub downloaded_headers: IntCounter,
     pub time_to_retrieve_sync_head_block: Arc<Mutex<Option<Duration>>>,
     pub headers_download_start_time: Arc<Mutex<Option<SystemTime>>>,
 
@@ -79,12 +79,10 @@ pub struct Metrics {
     pub storage_tries_download_end_time: Arc<Mutex<Option<SystemTime>>>,
 
     // Storage slots
-    pub downloaded_storage_slots: AtomicU64,
-    pub storage_accounts_initial: AtomicU64,
-    pub storage_accounts_healed: AtomicU64,
+    pub storage_leaves_downloaded: IntCounter,
+    pub storage_leaves_inserted: IntCounter,
     pub storage_tries_insert_end_time: Arc<Mutex<Option<SystemTime>>>,
     pub storage_tries_insert_start_time: Arc<Mutex<Option<SystemTime>>>,
-    pub storage_tries_state_roots_computed: IntCounter,
 
     // Healing
     pub healing_empty_try_recv: AtomicU64,
@@ -175,10 +173,10 @@ impl fmt::Display for CurrentStepValue {
             CurrentStepValue::RequestingStorageRanges => write!(f, "Requesting Storage Ranges"),
             CurrentStepValue::DownloadingHeaders => write!(f, "Downloading Headers"),
             CurrentStepValue::InsertingStorageRanges => {
-                write!(f, "Inserting Storage Ranges - \x1b[31mWriting to DB\x1b[0m")
+                write!(f, "Inserting Storage Ranges - Writing to DB")
             }
             CurrentStepValue::InsertingAccountRanges => {
-                write!(f, "Inserting Account Ranges - \x1b[31mWriting to DB\x1b[0m")
+                write!(f, "Inserting Account Ranges - Writing to DB")
             }
             CurrentStepValue::InsertingAccountRangesNoDb => write!(f, "Inserting Account Ranges"),
         }
@@ -203,10 +201,10 @@ impl Metrics {
 
         self.contacts.fetch_add(1, Ordering::Relaxed);
 
-        self.update_rate(&mut events, &self.new_contacts_rate).await;
+        self.update_rate(&mut events, &self.new_contacts_rate);
     }
 
-    pub async fn record_new_discarded_node(&self) {
+    pub fn record_new_discarded_node(&self) {
         self.discarded_nodes.inc();
 
         self.contacts.fetch_sub(1, Ordering::Relaxed);
@@ -219,8 +217,7 @@ impl Metrics {
 
         self.connection_attempts.inc();
 
-        self.update_rate(&mut events, &self.new_connection_attempts_rate)
-            .await;
+        self.update_rate(&mut events, &self.new_connection_attempts_rate);
     }
 
     pub async fn record_new_rlpx_conn_established(&self, client_version: &str) {
@@ -232,17 +229,36 @@ impl Metrics {
 
         self.peers.fetch_add(1, Ordering::Relaxed);
 
-        self.update_rate(&mut events, &self.new_connection_establishments_rate)
-            .await;
+        let client_type = client_version.split('/').next().unwrap_or("unknown");
+
+        // TODO (#4240): This module expose metrics to be used in the snapsync logs, to actually
+        // expose them in prometheus we need to call the metrics crate instead, so we do it here.
+        // In the future this module will be rewritten as part of the snapsync rewrite and all
+        // the metrics calls will be done directly using the metrics crate.
+        #[cfg(feature = "metrics")]
+        {
+            use ethrex_metrics::p2p::METRICS_P2P;
+            METRICS_P2P.inc_peer_count();
+            METRICS_P2P.inc_peer_client(client_type);
+        }
+
+        self.update_rate(&mut events, &self.new_connection_establishments_rate);
 
         let mut clients = self.peers_by_client_type.lock().await;
-        let split = client_version.split('/').collect::<Vec<&str>>();
-        let client_type = split.first().expect("Split always returns 1 element");
-
         clients
             .entry(client_type.to_string())
             .and_modify(|count| *count += 1)
-            .or_insert(1);
+            .or_insert_with(|| {
+                // First time seeing this client type, initialize disconnection metrics
+                #[cfg(feature = "metrics")]
+                {
+                    use ethrex_metrics::p2p::METRICS_P2P;
+                    for reason in DisconnectReason::all() {
+                        METRICS_P2P.init_disconnection(&reason.to_string(), client_type);
+                    }
+                }
+                1
+            });
     }
 
     pub async fn record_ping_sent(&self) {
@@ -252,7 +268,7 @@ impl Metrics {
 
         self.pings_sent.inc();
 
-        self.update_rate(&mut events, &self.pings_sent_rate).await;
+        self.update_rate(&mut events, &self.pings_sent_rate);
     }
 
     pub async fn record_new_rlpx_conn_disconnection(
@@ -260,11 +276,18 @@ impl Metrics {
         client_version: &str,
         reason: DisconnectReason,
     ) {
-        self.peers.fetch_add(1, Ordering::Relaxed);
+        self.peers.fetch_sub(1, Ordering::Relaxed);
+
+        let client_type = client_version.split('/').next().unwrap_or("unknown");
+        #[cfg(feature = "metrics")]
+        {
+            use ethrex_metrics::p2p::METRICS_P2P;
+            METRICS_P2P.dec_peer_count();
+            METRICS_P2P.dec_peer_client(client_type);
+            METRICS_P2P.inc_disconnection(&reason.to_string(), client_type);
+        }
 
         let mut clients = self.peers_by_client_type.lock().await;
-        let split = client_version.split('/').collect::<Vec<&str>>();
-        let client_type = split.first().expect("Split always returns 1 element");
 
         let mut disconnection_by_client = self.disconnections_by_client_type.lock().await;
         disconnection_by_client
@@ -282,12 +305,11 @@ impl Metrics {
     pub async fn record_new_rlpx_conn_failure(&self, reason: PeerConnectionError) {
         let mut failures_grouped_by_reason = self.connection_attempt_failures.lock().await;
 
-        self.update_failures_grouped_by_reason(&mut failures_grouped_by_reason, &reason)
-            .await;
+        self.update_failures_grouped_by_reason(&mut failures_grouped_by_reason, &reason);
     }
 
-    pub async fn update_rate(&self, events: &mut VecDeque<SystemTime>, rate_gauge: &Gauge) {
-        self.clean_old_events(events).await;
+    pub fn update_rate(&self, events: &mut VecDeque<SystemTime>, rate_gauge: &Gauge) {
+        self.clean_old_events(events);
 
         let count = events.len() as f64;
 
@@ -311,7 +333,7 @@ impl Metrics {
         rate_gauge.set(rate);
     }
 
-    pub async fn clean_old_events(&self, events: &mut VecDeque<SystemTime>) {
+    pub fn clean_old_events(&self, events: &mut VecDeque<SystemTime>) {
         let now = SystemTime::now();
 
         while let Some(&event_time) = events.front() {
@@ -323,7 +345,7 @@ impl Metrics {
         }
     }
 
-    pub async fn update_failures_grouped_by_reason(
+    pub fn update_failures_grouped_by_reason(
         &self,
         failures_grouped_by_reason: &mut BTreeMap<String, u64>,
         failure_reason: &PeerConnectionError,
@@ -350,6 +372,18 @@ impl Metrics {
             PeerConnectionError::TooManyPeers => {
                 failures_grouped_by_reason
                     .entry("TooManyPeers".to_owned())
+                    .and_modify(|e| *e += 1)
+                    .or_insert(1);
+            }
+            PeerConnectionError::OutboundSendTimeout => {
+                failures_grouped_by_reason
+                    .entry("OutboundSendTimeout".to_owned())
+                    .and_modify(|e| *e += 1)
+                    .or_insert(1);
+            }
+            PeerConnectionError::OutboundQueueFull => {
+                failures_grouped_by_reason
+                    .entry("OutboundQueueFull".to_owned())
                     .and_modify(|e| *e += 1)
                     .or_insert(1);
             }
@@ -485,6 +519,7 @@ impl Metrics {
                     .and_modify(|e| *e += 1)
                     .or_insert(1);
             }
+            #[cfg(feature = "l2")]
             PeerConnectionError::RollupStoreError(error) => {
                 failures_grouped_by_reason
                     .entry(format!("RollupStoreError - {error}"))
@@ -515,7 +550,7 @@ impl Metrics {
                     .and_modify(|e| *e += 1)
                     .or_insert(1);
             }
-            PeerConnectionError::PeerTableError(error) => {
+            PeerConnectionError::ActorError(error) => {
                 failures_grouped_by_reason
                     .entry(format!("InternalError - {error}"))
                     .and_modify(|e| *e += 1)
@@ -623,15 +658,35 @@ impl Default for Metrics {
             .register(Box::new(pings_sent_rate.clone()))
             .expect("Failed to register pings_sent_rate gauge");
 
-        let storage_tries_state_roots_computed = IntCounter::new(
-            "storage_tries_state_roots_computed",
-            "Total number of storage tries state roots computed",
+        let storage_leaves_inserted = IntCounter::new(
+            "storage_leaves_inserted",
+            "Total number of storage leaves inserted",
         )
-        .expect("Failed to create storage_tries_state_roots_computed counter");
+        .expect("Failed to create storage_leaves_inserted counter");
 
         registry
-            .register(Box::new(storage_tries_state_roots_computed.clone()))
-            .expect("Failed to register storage_tries_state_roots_computed counter");
+            .register(Box::new(storage_leaves_inserted.clone()))
+            .expect("Failed to register storage_leaves_inserted counter");
+
+        let downloaded_headers = IntCounter::new(
+            "downloaded_headers",
+            "Total number of headers already download",
+        )
+        .expect("Failed to create downloaded_headers counter");
+
+        registry
+            .register(Box::new(downloaded_headers.clone()))
+            .expect("Failed to register downloaded_headers counter");
+
+        let storage_leaves_downloaded = IntCounter::new(
+            "storage_leaves_downloaded",
+            "Total number of storage leaves downloaded",
+        )
+        .expect("Failed to create storage_leaves_downloaded counter");
+
+        registry
+            .register(Box::new(storage_leaves_downloaded.clone()))
+            .expect("Failed to register storage_leaves_downloaded counter");
 
         Metrics {
             _registry: registry,
@@ -666,12 +721,12 @@ impl Default for Metrics {
             /* Snap Sync */
             // Common
             sync_head_block: AtomicU64::new(0),
+            pivot_timestamp: AtomicU64::new(0),
             sync_head_hash: Arc::new(Mutex::new(H256::default())),
             current_step: Arc::new(CurrentStep(AtomicU8::new(0))),
 
             // Headers
-            headers_to_download: AtomicU64::new(0),
-            downloaded_headers: AtomicU64::new(0),
+            downloaded_headers,
             time_to_retrieve_sync_head_block: Arc::new(Mutex::new(None)),
             headers_download_start_time: Arc::new(Mutex::new(None)),
 
@@ -688,12 +743,10 @@ impl Default for Metrics {
             storage_tries_download_end_time: Arc::new(Mutex::new(None)),
 
             // Storage slots
-            downloaded_storage_slots: AtomicU64::new(0),
+            storage_leaves_downloaded,
 
             // Storage tries state roots
-            storage_tries_state_roots_computed,
-            storage_accounts_initial: AtomicU64::new(0),
-            storage_accounts_healed: AtomicU64::new(0),
+            storage_leaves_inserted,
             storage_tries_insert_end_time: Arc::new(Mutex::new(None)),
             storage_tries_insert_start_time: Arc::new(Mutex::new(None)),
 

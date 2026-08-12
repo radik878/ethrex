@@ -1,28 +1,21 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::{Arc, RwLock},
-};
-
 use super::{
     codec::RLPxCodec,
     server::{Initiator, Receiver},
 };
+#[cfg(feature = "l2")]
+use crate::rlpx::l2::l2_connection::L2ConnState;
 use crate::{
     rlpx::{
         connection::server::{ConnectionState, Established},
         error::PeerConnectionError,
-        l2::l2_connection::L2ConnState,
         message::EthCapVersion,
-        utils::{
-            compress_pubkey, decompress_pubkey, ecdh_xchng, kdf, log_peer_debug, sha256,
-            sha256_hmac,
-        },
+        utils::{compress_pubkey, decompress_pubkey, ecdh_xchng, kdf, sha256, sha256_hmac},
     },
     types::Node,
 };
 use aes::cipher::{KeyIvInit, StreamCipher};
 use ethrex_common::{H128, H256, H512, Signature};
+use ethrex_crypto::keccak::keccak_hash;
 use ethrex_rlp::{
     decode::RLPDecode,
     encode::RLPEncode,
@@ -35,12 +28,17 @@ use secp256k1::{
     PublicKey, SecretKey,
     ecdsa::{RecoverableSignature, RecoveryId},
 };
-use sha3::{Digest, Keccak256};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpSocket, TcpStream},
 };
 use tokio_util::codec::Framed;
+use tracing::{debug, trace};
 
 type Aes128Ctr64BE = ctr::Ctr64BE<aes::Aes128>;
 
@@ -64,14 +62,14 @@ pub(crate) async fn perform(
     state: ConnectionState,
     eth_version: Arc<RwLock<EthCapVersion>>,
 ) -> Result<(Established, SplitStream<Framed<TcpStream, RLPxCodec>>), PeerConnectionError> {
-    let (context, node, framed) = match state {
-        ConnectionState::Initiator(Initiator { context, node, .. }) => {
+    let (context, node, framed, is_inbound) = match state {
+        ConnectionState::Initiator(Initiator { context, node }) => {
             let addr = SocketAddr::new(node.ip, node.tcp_port);
             let mut stream = match tcp_stream(addr).await {
                 Ok(result) => result,
                 Err(error) => {
-                    log_peer_debug(&node, &format!("Error creating tcp connection {error}"));
-                    // context.table.lock().await.replace_peer(node.node_id());
+                    // If we can't find a TCP connection it's an issue we should track in debug
+                    debug!(peer=%node, %error, "Error creating tcp connection");
                     return Err(error)?;
                 }
             };
@@ -80,10 +78,10 @@ pub(crate) async fn perform(
             // Local node is initator
             // keccak256(nonce || initiator-nonce)
             let hashed_nonces: [u8; 32] =
-                Keccak256::digest([remote_state.nonce.0, local_state.nonce.0].concat()).into();
+                keccak_hash([remote_state.nonce.0, local_state.nonce.0].concat());
             let codec = RLPxCodec::new(&local_state, &remote_state, hashed_nonces, eth_version)?;
-            log_peer_debug(&node, "Completed handshake as initiator");
-            (context, node, Framed::new(stream, codec))
+            trace!(peer=%node, "Completed handshake as initiator");
+            (context, node, Framed::new(stream, codec), false)
         }
         ConnectionState::Receiver(Receiver {
             context,
@@ -100,7 +98,7 @@ pub(crate) async fn perform(
             // Remote node is initiator
             // keccak256(nonce || initiator-nonce)
             let hashed_nonces: [u8; 32] =
-                Keccak256::digest([local_state.nonce.0, remote_state.nonce.0].concat()).into();
+                keccak_hash([local_state.nonce.0, remote_state.nonce.0].concat());
             let codec = RLPxCodec::new(&local_state, &remote_state, hashed_nonces, eth_version)?;
             let node = Node::new(
                 peer_addr.ip(),
@@ -108,8 +106,8 @@ pub(crate) async fn perform(
                 peer_addr.port(),
                 remote_state.public_key,
             );
-            log_peer_debug(&node, "Completed handshake as receiver");
-            (context, node, Framed::new(stream, codec))
+            trace!(peer=%node, "Completed handshake as receiver");
+            (context, node, Framed::new(stream, codec), true)
         }
         ConnectionState::Established(_) => {
             return Err(PeerConnectionError::StateError(
@@ -125,11 +123,17 @@ pub(crate) async fn perform(
         }
     };
     let (sink, stream) = framed.split();
+    // Move the socket sink into a dedicated writer task; the actor keeps only a bounded
+    // sender, so it never blocks on a slow peer's network write (see `spawn_outbound_writer`).
+    let (outbound_tx, outbound_writer_timed_out) =
+        crate::rlpx::connection::server::spawn_outbound_writer(sink);
     Ok((
         Established {
             signer: context.signer,
-            sink,
-            node: node.clone(),
+            outbound_tx,
+            outbound_writer_timed_out,
+            node,
+            is_inbound,
             storage: context.storage.clone(),
             blockchain: context.blockchain.clone(),
             capabilities: vec![],
@@ -137,14 +141,23 @@ pub(crate) async fn perform(
             negotiated_snap_capability: None,
             last_block_range_update_block: 0,
             requested_pooled_txs: HashMap::new(),
+            pending_tx_requests: Vec::new(),
             client_version: context.client_version.clone(),
             connection_broadcast_send: context.broadcast.clone(),
             peer_table: context.table.clone(),
+            #[cfg(feature = "l2")]
             l2_state: context
                 .based_context
                 .map_or_else(|| L2ConnState::Unsupported, L2ConnState::Disconnected),
-            tx_broadcaster: context.tx_broadcaster.clone(),
+            tx_broadcaster: context.tx_broadcaster,
             current_requests: HashMap::new(),
+            disconnect_reason: None,
+            is_validated: false,
+            serve_request_window_start: std::time::Instant::now(),
+            serve_requests_in_window: 0,
+            txs_sent_to_peer: 0,
+            received_txs_from_peer: false,
+            missed_pongs: 0,
         },
         stream,
     ))
@@ -215,7 +228,7 @@ async fn receive_auth<S: AsyncRead + std::marker::Unpin>(
         public_key: auth.public_key,
         nonce: auth.nonce,
         ephemeral_key: remote_ephemeral_key,
-        init_message: msg_bytes.to_owned(),
+        init_message: msg_bytes,
     })
 }
 
@@ -240,7 +253,7 @@ async fn receive_ack<S: AsyncRead + std::marker::Unpin>(
         public_key: remote_public_key,
         nonce: ack.nonce,
         ephemeral_key: remote_ephemeral_key,
-        init_message: msg_bytes.to_owned(),
+        init_message: msg_bytes,
     })
 }
 
@@ -259,15 +272,8 @@ async fn receive_handshake_msg<S: AsyncRead + std::marker::Unpin>(
     buf.resize(msg_size + 2, 0);
 
     // Read the rest of the message
-    // Guard unwrap
-    if buf.len() < msg_size + 2 {
-        return Err(PeerConnectionError::CryptographyError(String::from(
-            "bad buf size",
-        )));
-    }
-    stream.read_exact(&mut buf[2..msg_size + 2]).await?;
-    let ack_bytes = &buf[..msg_size + 2];
-    Ok(ack_bytes.to_vec())
+    stream.read_exact(&mut buf[2..]).await?;
+    Ok(buf)
 }
 
 /// Encodes an Auth message, to start a handshake.
@@ -345,7 +351,7 @@ fn encode_ack_message(
 }
 
 /// Decodes an Ack message, completing a handshake.
-fn decode_ack_message(
+pub fn decode_ack_message(
     static_key: &SecretKey,
     msg: &[u8],
     auth_data: &[u8],
@@ -556,7 +562,7 @@ impl RLPDecode for AuthMessage {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AckMessage {
+pub struct AckMessage {
     /// The recipient's ephemeral public key.
     pub ephemeral_pubkey: H512,
     /// The nonce generated by the recipient.
@@ -605,46 +611,5 @@ impl RLPDecode for AckMessage {
             version,
         };
         Ok((this, rest))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use ethrex_common::H256;
-    use hex_literal::hex;
-    use secp256k1::SecretKey;
-
-    use crate::rlpx::{connection::handshake::decode_ack_message, utils::decompress_pubkey};
-
-    #[test]
-    fn test_ack_decoding() {
-        // This is the Ack₂ message from EIP-8.
-        // https://github.com/ethereum/EIPs/blob/master/EIPS/eip-8.md
-        let msg = hex!(
-            "01ea0451958701280a56482929d3b0757da8f7fbe5286784beead59d95089c217c9b917788989470b0e330cc6e4fb383c0340ed85fab836ec9fb8a49672712aeabbdfd1e837c1ff4cace34311cd7f4de05d59279e3524ab26ef753a0095637ac88f2b499b9914b5f64e143eae548a1066e14cd2f4bd7f814c4652f11b254f8a2d0191e2f5546fae6055694aed14d906df79ad3b407d94692694e259191cde171ad542fc588fa2b7333313d82a9f887332f1dfc36cea03f831cb9a23fea05b33deb999e85489e645f6aab1872475d488d7bd6c7c120caf28dbfc5d6833888155ed69d34dbdc39c1f299be1057810f34fbe754d021bfca14dc989753d61c413d261934e1a9c67ee060a25eefb54e81a4d14baff922180c395d3f998d70f46f6b58306f969627ae364497e73fc27f6d17ae45a413d322cb8814276be6ddd13b885b201b943213656cde498fa0e9ddc8e0b8f8a53824fbd82254f3e2c17e8eaea009c38b4aa0a3f306e8797db43c25d68e86f262e564086f59a2fc60511c42abfb3057c247a8a8fe4fb3ccbadde17514b7ac8000cdb6a912778426260c47f38919a91f25f4b5ffb455d6aaaf150f7e5529c100ce62d6d92826a71778d809bdf60232ae21ce8a437eca8223f45ac37f6487452ce626f549b3b5fdee26afd2072e4bc75833c2464c805246155289f4"
-        );
-        let static_key_a = SecretKey::from_slice(&hex!(
-            "49a7b37aa6f6645917e7b807e9d1c00d4fa71f18343b0d4122a4d2df64dd6fee"
-        ))
-        .unwrap();
-
-        let expected_nonce_b =
-            H256::from_str("559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd")
-                .unwrap();
-        let expected_ephemeral_key_b = decompress_pubkey(
-            &SecretKey::from_slice(&hex!(
-                "e238eb8e04fee6511ab04c6dd3c89ce097b11f25d584863ac2b6d5b35b1847e4"
-            ))
-            .unwrap()
-            .public_key(secp256k1::SECP256K1),
-        );
-
-        let ack = decode_ack_message(&static_key_a, &msg[2..], &msg[..2]).unwrap();
-
-        assert_eq!(ack.ephemeral_pubkey, expected_ephemeral_key_b);
-        assert_eq!(ack.nonce, expected_nonce_b);
-        assert_eq!(ack.version, 4u8);
     }
 }

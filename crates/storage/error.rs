@@ -38,4 +38,18 @@ pub enum StoreError {
     TryInto(#[from] std::num::TryFromIntError),
     #[error("Update batch contains no blocks")]
     UpdateBatchNoBlocks,
+    #[error("Pivot changed")]
+    PivotChanged,
+    #[error("Error reading from disk: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Error serializing metadata: {0}")]
+    DbMetadataError(#[from] serde_json::Error),
+    #[error(
+        "Cannot migrate the database: its version is unavailable, which means it predates versioning and migrations. A full resync (removedb) is required."
+    )]
+    NotFoundDBVersion,
+    #[error("Incompatible DB Version: found v{found}, expected v{expected}")]
+    IncompatibleDBVersion { found: u64, expected: u64 },
+    #[error("Migration from v{from} to v{to} failed: {reason}")]
+    MigrationFailed { from: u64, to: u64, reason: String },
 }

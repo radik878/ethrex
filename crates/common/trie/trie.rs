@@ -1,45 +1,84 @@
+#![cfg_attr(not(feature = "std"), no_std)]
+// In no_std builds the per-node hash cache (`OnceLock`) is a non-atomic, `!Sync`
+// cell (see `node::OnceLock`), which makes `Node` `!Sync` and trips
+// `arc_with_non_send_sync` on the `Arc<Node>` in `NodeRef`. The `Arc` is
+// deliberate: the type is shared with the std build, where `Node` is `Send + Sync`
+// and nodes are handed across rayon workers during parallel merkleization. The
+// single-threaded no_std consumer (the zkVM guest) never shares across threads, so
+// the atomic refcount is harmless here and keeps a single unified node type across
+// both builds.
+#![cfg_attr(not(feature = "std"), allow(clippy::arc_with_non_send_sync))]
+
+#[macro_use]
+extern crate alloc;
+
 pub mod db;
 pub mod error;
+// Witness recording (Arc<Mutex>) is host-only; the guest verifies against a witness.
+#[cfg(feature = "std")]
 pub mod logger;
 mod nibbles;
 pub mod node;
 mod node_hash;
+pub mod rkyv_utils;
 mod rlp;
 #[cfg(test)]
 mod test_utils;
+// Parallel merkleization (std threads + crossbeam) is host-only.
+#[cfg(feature = "std")]
+pub mod threadpool;
 mod trie_iter;
+#[cfg(feature = "std")]
 pub mod trie_sorted;
 mod verify_range;
+
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
 use ethereum_types::H256;
+use ethrex_crypto::{Crypto, NativeCrypto};
 use ethrex_rlp::constants::RLP_NULL;
-use sha3::{Digest, Keccak256};
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex};
+use ethrex_rlp::encode::RLPEncode;
+
+#[cfg(feature = "std")]
+use rustc_hash::FxHashSet;
+// `FxHashMap` is part of the public API (`get_embedded_root_committed`). Its concrete
+// type is build-dependent, so callers that build this crate `no_std` (e.g. the guest
+// via `ethrex-common`) must name it through this re-export to stay type-compatible.
+#[cfg(feature = "std")]
+pub use rustc_hash::FxHashMap;
+// rustc-hash's map/set aliases require std; use hashbrown with the Fx hasher otherwise.
+#[cfg(not(feature = "std"))]
+pub type FxHashMap<K, V> = hashbrown::HashMap<K, V, rustc_hash::FxBuildHasher>;
+#[cfg(not(feature = "std"))]
+type FxHashSet<K> = hashbrown::HashSet<K, rustc_hash::FxBuildHasher>;
 
 pub use self::db::{InMemoryTrieDB, TrieDB};
+#[cfg(feature = "std")]
 pub use self::logger::{TrieLogger, TrieWitness};
 pub use self::nibbles::Nibbles;
+#[cfg(feature = "std")]
+pub use self::threadpool::ThreadPool;
 pub use self::verify_range::verify_range;
 pub use self::{
-    node::{Node, NodeRef},
+    node::{Node, NodeRef, OnceLock},
     node_hash::NodeHash,
 };
 
-pub use self::error::TrieError;
+pub use self::error::{ExtensionNodeErrorData, InconsistentTreeError, TrieError};
 use self::{node::LeafNode, trie_iter::TrieIterator};
 
 use ethrex_rlp::decode::RLPDecode;
-use lazy_static::lazy_static;
 
-lazy_static! {
-    // Hash value for an empty trie, equal to keccak(RLP_NULL)
-    pub static ref EMPTY_TRIE_HASH: H256 = H256::from_slice(
-        Keccak256::new()
-            .chain_update([RLP_NULL])
-            .finalize()
-            .as_slice(),
-    );
-}
+/// Hash of an empty trie: `keccak256(RLP_NULL)`, a well-known Ethereum constant.
+/// Hardcoded so it needs no lazy initialization, works in `const` contexts, and
+/// pulls no lazy-cell dependency into `no_std` builds. The
+/// `empty_trie_hash_matches_keccak` test pins it to the computed value.
+pub const EMPTY_TRIE_HASH: H256 = H256([
+    0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
+    0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+]);
 
 /// RLP-encoded trie path
 pub type PathRLP = Vec<u8>;
@@ -54,9 +93,11 @@ pub type TrieNode = (Nibbles, NodeRLP);
 pub struct Trie {
     db: Box<dyn TrieDB>,
     pub root: NodeRef,
-    pending_removal: HashSet<Nibbles>,
+    pending_removal: FxHashSet<Nibbles>,
+    dirty: FxHashSet<Nibbles>,
 }
 
+// `Default` builds an in-memory (InMemoryTrieDB) trie.
 impl Default for Trie {
     fn default() -> Self {
         Self::new_temp()
@@ -69,7 +110,8 @@ impl Trie {
         Self {
             db,
             root: NodeRef::default(),
-            pending_removal: HashSet::new(),
+            pending_removal: Default::default(),
+            dirty: Default::default(),
         }
     }
 
@@ -77,12 +119,13 @@ impl Trie {
     pub fn open(db: Box<dyn TrieDB>, root: H256) -> Self {
         Self {
             db,
-            root: if root != *EMPTY_TRIE_HASH {
+            root: if root != EMPTY_TRIE_HASH {
                 NodeHash::from(root).into()
             } else {
                 Default::default()
             },
-            pending_removal: HashSet::new(),
+            pending_removal: Default::default(),
+            dirty: Default::default(),
         }
     }
 
@@ -95,19 +138,30 @@ impl Trie {
     }
 
     /// Retrieve an RLP-encoded value from the trie given its RLP-encoded path.
-    pub fn get(&self, pathrlp: &PathRLP) -> Result<Option<ValueRLP>, TrieError> {
+    pub fn get(&self, pathrlp: &[u8]) -> Result<Option<ValueRLP>, TrieError> {
         let path = Nibbles::from_bytes(pathrlp);
+
+        if !self.dirty.contains(&path) && self.db().flatkeyvalue_computed(path.clone()) {
+            let Some(value_rlp) = self.db.get(path)? else {
+                return Ok(None);
+            };
+            if value_rlp.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(value_rlp));
+        }
 
         Ok(match self.root {
             NodeRef::Node(ref node, _) => node.get(self.db.as_ref(), path)?,
-            NodeRef::Hash(hash) if hash.is_valid() => Node::decode(
-                &self
-                    .db
-                    .get(Nibbles::default())?
-                    .ok_or(TrieError::InconsistentTree)?,
-            )
-            .map_err(TrieError::RLPDecode)?
-            .get(self.db.as_ref(), path)?,
+            NodeRef::Hash(hash) if hash.is_valid() => {
+                Node::decode(&self.db.get(Nibbles::default())?.ok_or_else(|| {
+                    TrieError::InconsistentTree(Box::new(InconsistentTreeError::RootNotFound(
+                        hash.finalize(&NativeCrypto),
+                    )))
+                })?)
+                .map_err(TrieError::RLPDecode)?
+                .get(self.db.as_ref(), path)?
+            }
             _ => None,
         })
     }
@@ -116,35 +170,47 @@ impl Trie {
     pub fn insert(&mut self, path: PathRLP, value: ValueRLP) -> Result<(), TrieError> {
         let path = Nibbles::from_bytes(&path);
         self.pending_removal.remove(&path);
+        self.dirty.insert(path.clone());
 
-        self.root = if self.root.is_valid() {
+        if self.root.is_valid() {
             // If the trie is not empty, call the root node's insertion logic.
             self.root
-                .get_node(self.db.as_ref(), Nibbles::default())?
-                .ok_or(TrieError::InconsistentTree)?
+                .get_node_mut(self.db.as_ref(), Nibbles::default())?
+                .ok_or_else(|| {
+                    TrieError::InconsistentTree(Box::new(InconsistentTreeError::RootNotFoundNoHash))
+                })?
                 .insert(self.db.as_ref(), path, value)?
-                .into()
         } else {
             // If the trie is empty, just add a leaf.
-            Node::from(LeafNode::new(path, value)).into()
+            self.root = Node::from(LeafNode::new(path, value)).into()
         };
+        self.root.clear_hash();
 
         Ok(())
     }
 
     /// Remove a value from the trie given its RLP-encoded path.
     /// Returns the value if it was succesfully removed or None if it wasn't part of the trie
-    pub fn remove(&mut self, path: &PathRLP) -> Result<Option<ValueRLP>, TrieError> {
+    pub fn remove(&mut self, path: &[u8]) -> Result<Option<ValueRLP>, TrieError> {
+        self.dirty.insert(Nibbles::from_bytes(path));
         if !self.root.is_valid() {
             return Ok(None);
         }
+        self.pending_removal.insert(Nibbles::from_bytes(path));
+
         // If the trie is not empty, call the root node's removal logic.
-        let (node, value) = self
+        let (is_trie_empty, value) = self
             .root
-            .get_node(self.db.as_ref(), Nibbles::default())?
-            .ok_or(TrieError::InconsistentTree)?
+            .get_node_mut(self.db.as_ref(), Nibbles::default())?
+            .ok_or_else(|| {
+                TrieError::InconsistentTree(Box::new(InconsistentTreeError::RootNotFoundNoHash))
+            })?
             .remove(self.db.as_ref(), Nibbles::from_bytes(path))?;
-        self.root = node.map(Into::into).unwrap_or_default();
+        if is_trie_empty {
+            self.root = NodeRef::default();
+        } else {
+            self.root.clear_hash();
+        }
 
         Ok(value)
     }
@@ -152,19 +218,35 @@ impl Trie {
     /// Return the hash of the trie's root node.
     /// Returns keccak(RLP_NULL) if the trie is empty
     /// Also commits changes to the DB
-    pub fn hash(&mut self) -> Result<H256, TrieError> {
-        self.commit()?;
-        Ok(self.hash_no_commit())
+    pub fn hash(&mut self, crypto: &dyn Crypto) -> Result<H256, TrieError> {
+        self.commit(crypto)?;
+        Ok(self.hash_no_commit(crypto))
     }
 
     /// Return the hash of the trie's root node.
     /// Returns keccak(RLP_NULL) if the trie is empty
-    pub fn hash_no_commit(&self) -> H256 {
+    pub fn hash_no_commit(&self, crypto: &dyn Crypto) -> H256 {
         if self.root.is_valid() {
-            self.root.compute_hash().finalize()
+            // 512 is the maximum size of an encoded node
+            let mut buf = Vec::with_capacity(512);
+            self.root
+                .compute_hash_no_alloc(&mut buf, crypto)
+                .finalize(crypto)
         } else {
-            *EMPTY_TRIE_HASH
+            EMPTY_TRIE_HASH
         }
+    }
+
+    pub fn get_root_node(&self, path: Nibbles) -> Result<Arc<Node>, TrieError> {
+        self.root
+            .get_node_checked(self.db.as_ref(), path)?
+            .ok_or_else(|| {
+                TrieError::InconsistentTree(Box::new(InconsistentTreeError::RootNotFound(
+                    self.root
+                        .compute_hash(&NativeCrypto)
+                        .finalize(&NativeCrypto),
+                )))
+            })
     }
 
     /// Returns a list of changes in a TrieNode format since last root hash processed.
@@ -172,9 +254,12 @@ impl Trie {
     /// # Returns
     ///
     /// A tuple containing the hash and the list of changes.
-    pub fn collect_changes_since_last_hash(&mut self) -> (H256, Vec<TrieNode>) {
-        let updates = self.commit_without_storing();
-        let ret_hash = self.hash_no_commit();
+    pub fn collect_changes_since_last_hash(
+        &mut self,
+        crypto: &dyn Crypto,
+    ) -> (H256, Vec<TrieNode>) {
+        let updates = self.commit_without_storing(crypto);
+        let ret_hash = self.hash_no_commit(crypto);
         (ret_hash, updates)
     }
 
@@ -182,21 +267,24 @@ impl Trie {
     ///
     /// This method will also compute the hash of all internal nodes indirectly. It will not clear
     /// the cached nodes.
-    pub fn commit(&mut self) -> Result<(), TrieError> {
-        let acc = self.commit_without_storing();
+    pub fn commit(&mut self, crypto: &dyn Crypto) -> Result<(), TrieError> {
+        let acc = self.commit_without_storing(crypto);
         self.db.put_batch(acc)?;
+
+        // Commit the underlying transaction
+        self.db.commit()?;
 
         Ok(())
     }
 
     /// Computes the nodes that would be added if updating the trie.
     /// Nodes are given with their hash pre-calculated.
-    pub fn commit_without_storing(&mut self) -> Vec<TrieNode> {
+    pub fn commit_without_storing(&mut self, crypto: &dyn Crypto) -> Vec<TrieNode> {
         let mut acc = Vec::new();
         if self.root.is_valid() {
-            self.root.commit(Nibbles::default(), &mut acc);
+            self.root.commit(Nibbles::default(), &mut acc, crypto);
         }
-        if self.root.compute_hash() == NodeHash::Hashed(*EMPTY_TRIE_HASH) {
+        if self.root.compute_hash(crypto) == NodeHash::Hashed(EMPTY_TRIE_HASH) {
             acc.push((Nibbles::default(), vec![RLP_NULL]))
         }
         acc.extend(self.pending_removal.drain().map(|nib| (nib, vec![])));
@@ -211,16 +299,19 @@ impl Trie {
     /// Note: This method has a different behavior in regard to non-existent trie root nodes. Normal
     ///   behavior is to return `Err(InconsistentTrie)`, but this method will return
     ///   `Ok(Vec::new())` instead.
-    pub fn get_proof(&self, path: &PathRLP) -> Result<Vec<NodeRLP>, TrieError> {
+    pub fn get_proof(&self, path: &[u8]) -> Result<Vec<NodeRLP>, TrieError> {
         if self.root.is_valid() {
-            let hash = self.root.compute_hash();
+            let hash = self.root.compute_hash(&NativeCrypto);
 
             let mut node_path = Vec::new();
             if let NodeHash::Inline((data, len)) = hash {
                 node_path.push(data[..len as usize].to_vec());
             }
 
-            let root = match self.root.get_node(self.db.as_ref(), Nibbles::default())? {
+            let root = match self
+                .root
+                .get_node_checked(self.db.as_ref(), Nibbles::default())?
+            {
                 Some(x) => x,
                 None => return Ok(Vec::new()),
             };
@@ -240,13 +331,9 @@ impl Trie {
         paths: &[PathRLP],
     ) -> Result<(Option<NodeRLP>, Vec<NodeRLP>), TrieError> {
         if self.root.is_valid() {
-            let encoded_root = self
-                .root
-                .get_node(self.db.as_ref(), Nibbles::default())?
-                .ok_or(TrieError::InconsistentTree)?
-                .encode_raw();
+            let encoded_root = self.get_root_node(Nibbles::default())?.encode_to_vec();
 
-            let mut node_path = HashSet::new();
+            let mut node_path: FxHashSet<_> = Default::default();
             for path in paths {
                 let mut nodes = self.get_proof(path)?;
                 nodes.swap_remove(0);
@@ -259,42 +346,41 @@ impl Trie {
         }
     }
 
+    #[cfg(feature = "std")]
     pub fn empty_in_memory() -> Self {
-        Self::new(Box::new(InMemoryTrieDB::new(Arc::new(Mutex::new(
-            BTreeMap::new(),
-        )))))
+        Self::new(Box::new(InMemoryTrieDB::new(Arc::new(
+            std::sync::Mutex::new(BTreeMap::new()),
+        ))))
     }
 
     /// Gets node with embedded references to child nodes, all in just one `Node`.
     pub fn get_embedded_root(
-        all_nodes: &BTreeMap<H256, Vec<u8>>,
+        all_nodes: &BTreeMap<H256, Node>,
         root_hash: H256,
     ) -> Result<NodeRef, TrieError> {
         // If the root hash is of the empty trie then we can get away by setting the NodeRef to default
-        if root_hash == *EMPTY_TRIE_HASH {
+        if root_hash == EMPTY_TRIE_HASH {
             return Ok(NodeRef::default());
         }
 
-        let root_rlp = all_nodes
-            .get(&root_hash)
-            .ok_or(TrieError::InconsistentTree)?;
+        let root_rlp = all_nodes.get(&root_hash).ok_or_else(|| {
+            TrieError::InconsistentTree(Box::new(InconsistentTreeError::RootNotFound(root_hash)))
+        })?;
 
         fn get_embedded_node(
-            all_nodes: &BTreeMap<H256, Vec<u8>>,
-            cur_node_rlp: &[u8],
+            all_nodes: &BTreeMap<H256, Node>,
+            cur_node: &Node,
         ) -> Result<Node, TrieError> {
-            let cur_node = Node::decode_raw(cur_node_rlp)?;
-
-            Ok(match cur_node {
+            Ok(match cur_node.clone() {
                 Node::Branch(mut node) => {
                     for choice in &mut node.choices {
                         let NodeRef::Hash(hash) = *choice else {
-                            unreachable!()
+                            continue;
                         };
 
                         if hash.is_valid() {
-                            *choice = match all_nodes.get(&hash.finalize()) {
-                                Some(rlp) => get_embedded_node(all_nodes, rlp)?.into(),
+                            *choice = match all_nodes.get(&hash.finalize(&NativeCrypto)) {
+                                Some(node) => get_embedded_node(all_nodes, node)?.into(),
                                 None => hash.into(),
                             };
                         }
@@ -304,11 +390,11 @@ impl Trie {
                 }
                 Node::Extension(mut node) => {
                     let NodeRef::Hash(hash) = node.child else {
-                        unreachable!()
+                        return Ok(node.into());
                     };
 
-                    node.child = match all_nodes.get(&hash.finalize()) {
-                        Some(rlp) => get_embedded_node(all_nodes, rlp)?.into(),
+                    node.child = match all_nodes.get(&hash.finalize(&NativeCrypto)) {
+                        Some(node) => get_embedded_node(all_nodes, node)?.into(),
                         None => hash.into(),
                     };
 
@@ -322,6 +408,81 @@ impl Trie {
         Ok(root.into())
     }
 
+    /// Gets node with embedded references to child nodes, all in just one `Node`.
+    ///
+    /// Note that this method caches the hash of each node, so it assumes the provided `all_nodes` are well-formed.
+    pub fn get_embedded_root_committed(
+        all_nodes: &FxHashMap<H256, Node>,
+        root_hash: H256,
+        crypto: &dyn Crypto,
+    ) -> Result<NodeRef, TrieError> {
+        // If the root hash is of the empty trie then we can get away by setting the NodeRef to default
+        if root_hash == EMPTY_TRIE_HASH {
+            return Ok(NodeRef::default());
+        }
+
+        let root_rlp = all_nodes.get(&root_hash).ok_or_else(|| {
+            TrieError::InconsistentTree(Box::new(InconsistentTreeError::RootNotFound(root_hash)))
+        })?;
+
+        /// Creates an embedded node reference with its hash slot pre-seeded.
+        ///
+        /// The caller must guarantee that `hash` is the hash of the referenced
+        /// node, for example because the node was just resolved by looking that
+        /// hash up. Seeding lets later hash computations over the subtree reuse
+        /// the known value instead of re-encoding and re-hashing it.
+        fn node_with_hash(node: Node, hash: NodeHash) -> NodeRef {
+            NodeRef::Node(Arc::new(node), OnceLock::from(hash))
+        }
+
+        fn get_embedded_node_committed(
+            all_nodes: &FxHashMap<H256, Node>,
+            cur_node: &Node,
+            crypto: &dyn Crypto,
+        ) -> Result<Node, TrieError> {
+            Ok(match cur_node.clone() {
+                Node::Branch(mut node) => {
+                    for choice in &mut node.choices {
+                        let NodeRef::Hash(hash) = *choice else {
+                            continue;
+                        };
+
+                        if hash.is_valid() {
+                            *choice = match all_nodes.get(&hash.finalize(crypto)) {
+                                Some(node) => node_with_hash(
+                                    get_embedded_node_committed(all_nodes, node, crypto)?,
+                                    hash,
+                                ),
+                                None => hash.into(),
+                            };
+                        }
+                    }
+
+                    (*node).into()
+                }
+                Node::Extension(mut node) => {
+                    let NodeRef::Hash(hash) = node.child else {
+                        return Ok(node.into());
+                    };
+
+                    node.child = match all_nodes.get(&hash.finalize(crypto)) {
+                        Some(node) => node_with_hash(
+                            get_embedded_node_committed(all_nodes, node, crypto)?,
+                            hash,
+                        ),
+                        None => hash.into(),
+                    };
+
+                    node.into()
+                }
+                Node::Leaf(node) => node.into(),
+            })
+        }
+
+        let root = get_embedded_node_committed(all_nodes, root_rlp, crypto)?;
+        Ok(node_with_hash(root, NodeHash::Hashed(root_hash)))
+    }
+
     /// Builds a trie from a set of nodes with an empty InMemoryTrieDB as a backend because the nodes are embedded in the root.
     ///
     /// Note: This method will not ensure that all node references are valid. Invalid references
@@ -329,9 +490,10 @@ impl Trie {
     ///   `Trie::remove`) to return `Err(InconsistentTrie)`.
     /// Note: This method will ignore any dangling nodes. All nodes that are not accessible from the
     ///   root node are considered dangling.
+    #[cfg(feature = "std")]
     pub fn from_nodes(
         root_hash: H256,
-        state_nodes: &BTreeMap<H256, NodeRLP>,
+        state_nodes: &BTreeMap<H256, Node>,
     ) -> Result<Self, TrieError> {
         let mut trie = Trie::new(Box::new(InMemoryTrieDB::default()));
         let root = Self::get_embedded_root(state_nodes, root_hash)?;
@@ -343,6 +505,7 @@ impl Trie {
     /// Builds an in-memory trie from the given elements and returns its hash
     pub fn compute_hash_from_unsorted_iter(
         iter: impl Iterator<Item = (PathRLP, ValueRLP)>,
+        crypto: &dyn Crypto,
     ) -> H256 {
         let mut trie = Trie::stateless();
         for (path, value) in iter {
@@ -350,7 +513,7 @@ impl Trie {
             trie.insert(path, value).unwrap();
         }
 
-        trie.hash_no_commit()
+        trie.hash_no_commit(crypto)
     }
 
     /// Creates a new stateless trie. This trie won't be able to store any nodes so all data will be lost after calculating the hash
@@ -388,12 +551,12 @@ impl Trie {
         fn get_node_inner(
             db: &dyn TrieDB,
             current_path: Nibbles,
-            node: Node,
+            node: &Node,
             mut partial_path: Nibbles,
         ) -> Result<Vec<u8>, TrieError> {
             // If we reached the end of the partial path, return the current node
             if partial_path.is_empty() {
-                return Ok(node.encode_raw());
+                return Ok(node.encode_to_vec());
             }
             match node {
                 Node::Branch(branch_node) => match partial_path.next_choice() {
@@ -402,9 +565,21 @@ impl Trie {
                         if child_ref.is_valid() {
                             let child_path = current_path.append_new(idx as u8);
                             let child_node = child_ref
-                                .get_node(db, child_path.clone())?
-                                .ok_or(TrieError::InconsistentTree)?;
-                            get_node_inner(db, child_path, child_node, partial_path)
+                                .get_node_checked(db, child_path.clone())?
+                                .ok_or_else(|| {
+                                    TrieError::InconsistentTree(Box::new(
+                                        InconsistentTreeError::NodeNotFoundOnBranchNode(
+                                            child_ref
+                                                .compute_hash(&NativeCrypto)
+                                                .finalize(&NativeCrypto),
+                                            branch_node
+                                                .compute_hash(&NativeCrypto)
+                                                .finalize(&NativeCrypto),
+                                            child_path.clone(),
+                                        ),
+                                    ))
+                                })?;
+                            get_node_inner(db, child_path, &child_node, partial_path)
                         } else {
                             Ok(vec![])
                         }
@@ -418,9 +593,25 @@ impl Trie {
                         let child_path = partial_path.concat(&extension_node.prefix);
                         let child_node = extension_node
                             .child
-                            .get_node(db, child_path.clone())?
-                            .ok_or(TrieError::InconsistentTree)?;
-                        get_node_inner(db, child_path, child_node, partial_path)
+                            .get_node_checked(db, child_path.clone())?
+                            .ok_or_else(|| {
+                                TrieError::InconsistentTree(Box::new(
+                                    InconsistentTreeError::ExtensionNodeChildNotFound(
+                                        ExtensionNodeErrorData {
+                                            node_hash: extension_node
+                                                .child
+                                                .compute_hash(&NativeCrypto)
+                                                .finalize(&NativeCrypto),
+                                            extension_node_hash: extension_node
+                                                .compute_hash(&NativeCrypto)
+                                                .finalize(&NativeCrypto),
+                                            extension_node_prefix: extension_node.prefix.clone(),
+                                            node_path: child_path.clone(),
+                                        },
+                                    ),
+                                ))
+                            })?;
+                        get_node_inner(db, child_path, &child_node, partial_path)
                     } else {
                         Ok(vec![])
                     }
@@ -431,12 +622,11 @@ impl Trie {
 
         // Fetch node
         if self.root.is_valid() {
+            let root_node = self.get_root_node(Default::default())?;
             get_node_inner(
                 self.db.as_ref(),
                 Default::default(),
-                self.root
-                    .get_node(self.db.as_ref(), Default::default())?
-                    .ok_or(TrieError::InconsistentTree)?,
+                &root_node,
                 partial_path,
             )
         } else {
@@ -444,18 +634,143 @@ impl Trie {
         }
     }
 
-    pub fn root_node(&self) -> Result<Option<Node>, TrieError> {
-        if self.hash_no_commit() == *EMPTY_TRIE_HASH {
-            return Ok(None);
+    pub fn root_node(&self) -> Result<Option<Arc<Node>>, TrieError> {
+        if self.root.is_valid() {
+            self.root.get_node(self.db.as_ref(), Nibbles::default())
+        } else {
+            Ok(None)
         }
-        self.root.get_node(self.db.as_ref(), Nibbles::default())
     }
 
     /// Creates a new Trie based on a temporary InMemory DB
-    fn new_temp() -> Self {
+    pub fn new_temp() -> Self {
         let db = InMemoryTrieDB::new(Default::default());
         Trie::new(Box::new(db))
     }
+
+    /// Creates a new Trie based on a temporary InMemory DB, with a specified root
+    ///
+    /// This is usually used to create a Trie from a root that was embedded with the rest of the nodes.
+    pub fn new_temp_with_root(root: NodeRef) -> Self {
+        let db = InMemoryTrieDB::new(Default::default());
+        let mut trie = Trie::new(Box::new(db));
+        trie.root = root;
+        trie
+    }
+
+    /// Validates that the Trie isn't missing any nodes expected in the branches
+    ///
+    /// This is used internally with debug assertions to check the status of the trie
+    /// after syncing operations.
+    /// Note: this operation validates the hashes because the iterator uses
+    /// get_node_checked. We shouldn't downgrade that to the unchecked version
+    pub fn validate(self) -> Result<(), TrieError> {
+        let mut expected_count = if self.root.is_valid() { 1 } else { 0 };
+        for (_, node) in self.into_iter() {
+            expected_count -= 1;
+            match node {
+                Node::Branch(branch_node) => {
+                    expected_count += branch_node
+                        .choices
+                        .iter()
+                        .filter(|child| child.is_valid())
+                        .count();
+                }
+                Node::Extension(_) => {
+                    expected_count += 1;
+                }
+                Node::Leaf(_) => {}
+            }
+        }
+        if expected_count != 0 {
+            return Err(TrieError::Verify(format!(
+                "Node count mismatch, expected {expected_count} more"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate the trie structure in parallel by splitting at the root branch node.
+    /// Each of the root's 16 subtrees is validated independently using rayon.
+    #[cfg(feature = "std")]
+    pub fn validate_parallel(self) -> Result<(), TrieError> {
+        use rayon::prelude::*;
+
+        if !self.root.is_valid() {
+            return Ok(());
+        }
+
+        let db = &*self.db;
+        let root_node = self
+            .root
+            .get_node_checked(db, Nibbles::default())?
+            .ok_or_else(|| TrieError::Verify("Root node not found".to_string()))?;
+
+        match &*root_node {
+            Node::Branch(branch_node) => {
+                let children: Vec<(Nibbles, NodeRef)> = branch_node
+                    .choices
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, child)| child.is_valid())
+                    .map(|(i, child)| {
+                        let path = Nibbles::default().append_new(i as u8);
+                        (path, child.clone())
+                    })
+                    .collect();
+
+                children.par_iter().try_for_each(|(start_path, start_ref)| {
+                    validate_subtree(db, start_path.clone(), start_ref.clone())
+                })
+            }
+            _ => {
+                // Non-branch root (rare): validate sequentially
+                validate_subtree(db, Nibbles::default(), self.root.clone())
+            }
+        }
+    }
+}
+
+/// Validate a subtree rooted at `start_ref`, checking that all referenced nodes exist
+/// and their hashes match.
+#[cfg(feature = "std")]
+fn validate_subtree(
+    db: &dyn TrieDB,
+    start_path: Nibbles,
+    start_ref: NodeRef,
+) -> Result<(), TrieError> {
+    let mut expected_count: isize = 1;
+    let mut stack = vec![(start_path, start_ref)];
+
+    while let Some((path, node_ref)) = stack.pop() {
+        let node = node_ref
+            .get_node_checked(db, path.clone())?
+            .ok_or_else(|| TrieError::Verify(format!("Missing node at path {path:?}")))?;
+
+        expected_count -= 1;
+        match &*node {
+            Node::Branch(branch) => {
+                for (choice, child) in branch.choices.iter().enumerate().rev() {
+                    if child.is_valid() {
+                        expected_count += 1;
+                        stack.push((path.append_new(choice as u8), child.clone()));
+                    }
+                }
+            }
+            Node::Extension(ext) => {
+                expected_count += 1;
+                stack.push((path.concat(&ext.prefix), ext.child.clone()));
+            }
+            Node::Leaf(_) => {}
+        }
+    }
+
+    if expected_count != 0 {
+        return Err(TrieError::Verify(format!(
+            "Node count mismatch in subtree, expected {expected_count} more"
+        )));
+    }
+    Ok(())
 }
 
 impl IntoIterator for Trie {
@@ -476,23 +791,25 @@ impl ProofTrie {
         partial_path: Nibbles,
         external_ref: NodeHash,
     ) -> Result<(), TrieError> {
-        self.0.root = if self.0.root.is_valid() {
+        if self.0.root.is_valid() {
             // If the trie is not empty, call the root node's insertion logic.
             self.0
                 .root
-                .get_node(self.0.db.as_ref(), Nibbles::default())?
-                .ok_or(TrieError::InconsistentTree)?
-                .insert(self.0.db.as_ref(), partial_path, external_ref)?
-                .into()
+                .get_node_mut(self.0.db.as_ref(), Nibbles::default())?
+                .ok_or_else(|| {
+                    TrieError::InconsistentTree(Box::new(InconsistentTreeError::RootNotFoundNoHash))
+                })?
+                .insert(self.0.db.as_ref(), partial_path, external_ref)?;
+            self.0.root.clear_hash();
         } else {
-            external_ref.into()
+            self.0.root = external_ref.into();
         };
 
         Ok(())
     }
 
-    pub fn hash(&self) -> H256 {
-        self.0.hash_no_commit()
+    pub fn hash(&self, crypto: &dyn Crypto) -> H256 {
+        self.0.hash_no_commit(crypto)
     }
 }
 
@@ -503,641 +820,14 @@ impl From<Trie> for ProofTrie {
 }
 
 #[cfg(test)]
-mod test {
-    use cita_trie::{MemoryDB as CitaMemoryDB, PatriciaTrie as CitaTrie, Trie as CitaTrieTrait};
-    use std::sync::Arc;
-
+mod tests {
     use super::*;
+    use ethrex_crypto::keccak::keccak_hash;
 
-    use hasher::HasherKeccak;
-    use hex_literal::hex;
-    use proptest::{
-        collection::{btree_set, vec},
-        prelude::*,
-        proptest,
-    };
-
+    // Pins the hardcoded `EMPTY_TRIE_HASH` to `keccak256(RLP_NULL)` so a typo in the
+    // byte literal can't silently diverge from the computed value.
     #[test]
-    fn compute_hash() {
-        let mut trie = Trie::new_temp();
-        trie.insert(b"first".to_vec(), b"value".to_vec()).unwrap();
-        trie.insert(b"second".to_vec(), b"value".to_vec()).unwrap();
-
-        assert_eq!(
-            trie.hash().unwrap().as_ref(),
-            hex!("f7537e7f4b313c426440b7fface6bff76f51b3eb0d127356efbe6f2b3c891501")
-        );
-    }
-
-    #[test]
-    fn compute_hash_long() {
-        let mut trie = Trie::new_temp();
-        trie.insert(b"first".to_vec(), b"value".to_vec()).unwrap();
-        trie.insert(b"second".to_vec(), b"value".to_vec()).unwrap();
-        trie.insert(b"third".to_vec(), b"value".to_vec()).unwrap();
-        trie.insert(b"fourth".to_vec(), b"value".to_vec()).unwrap();
-
-        assert_eq!(
-            trie.hash().unwrap().0.to_vec(),
-            hex!("e2ff76eca34a96b68e6871c74f2a5d9db58e59f82073276866fdd25e560cedea")
-        );
-    }
-
-    #[test]
-    fn get_insert_words() {
-        let mut trie = Trie::new_temp();
-        let first_path = b"first".to_vec();
-        let first_value = b"value_a".to_vec();
-        let second_path = b"second".to_vec();
-        let second_value = b"value_b".to_vec();
-        // Check that the values dont exist before inserting
-        assert!(trie.get(&first_path).unwrap().is_none());
-        assert!(trie.get(&second_path).unwrap().is_none());
-        // Insert values
-        trie.insert(first_path.clone(), first_value.clone())
-            .unwrap();
-        trie.insert(second_path.clone(), second_value.clone())
-            .unwrap();
-        // Check values
-        assert_eq!(trie.get(&first_path).unwrap(), Some(first_value));
-        assert_eq!(trie.get(&second_path).unwrap(), Some(second_value));
-    }
-
-    #[test]
-    fn get_insert_zero() {
-        let mut trie = Trie::new_temp();
-        trie.insert(vec![0x0], b"value".to_vec()).unwrap();
-        let first = trie.get(&[0x0][..].to_vec()).unwrap();
-        assert_eq!(first, Some(b"value".to_vec()));
-    }
-
-    #[test]
-    fn get_insert_a() {
-        let mut trie = Trie::new_temp();
-        trie.insert(vec![16], vec![0]).unwrap();
-        trie.insert(vec![16, 0], vec![0]).unwrap();
-
-        let item = trie.get(&vec![16]).unwrap();
-        assert_eq!(item, Some(vec![0]));
-
-        let item = trie.get(&vec![16, 0]).unwrap();
-        assert_eq!(item, Some(vec![0]));
-    }
-
-    #[test]
-    fn get_insert_b() {
-        let mut trie = Trie::new_temp();
-        trie.insert(vec![0, 0], vec![0, 0]).unwrap();
-        trie.insert(vec![1, 0], vec![1, 0]).unwrap();
-
-        let item = trie.get(&vec![1, 0]).unwrap();
-        assert_eq!(item, Some(vec![1, 0]));
-
-        let item = trie.get(&vec![0, 0]).unwrap();
-        assert_eq!(item, Some(vec![0, 0]));
-    }
-
-    #[test]
-    fn get_insert_c() {
-        let mut trie = Trie::new_temp();
-        let vecs = vec![
-            vec![26, 192, 44, 251],
-            vec![195, 132, 220, 124, 112, 201, 70, 128, 235],
-            vec![126, 138, 25, 245, 146],
-            vec![129, 176, 66, 2, 150, 151, 180, 60, 124],
-            vec![138, 101, 157],
-        ];
-        for x in &vecs {
-            trie.insert(x.clone(), x.clone()).unwrap();
-        }
-        for x in &vecs {
-            let item = trie.get(x).unwrap();
-            assert_eq!(item, Some(x.clone()));
-        }
-    }
-
-    #[test]
-    fn get_insert_d() {
-        let mut trie = Trie::new_temp();
-        let vecs = vec![
-            vec![52, 53, 143, 52, 206, 112],
-            vec![14, 183, 34, 39, 113],
-            vec![55, 5],
-            vec![134, 123, 19],
-            vec![0, 59, 240, 89, 83, 167],
-            vec![22, 41],
-            vec![13, 166, 159, 101, 90, 234, 91],
-            vec![31, 180, 161, 122, 115, 51, 37, 61, 101],
-            vec![208, 192, 4, 12, 163, 254, 129, 206, 109],
-        ];
-        for x in &vecs {
-            trie.insert(x.clone(), x.clone()).unwrap();
-        }
-        for x in &vecs {
-            let item = trie.get(x).unwrap();
-            assert_eq!(item, Some(x.clone()));
-        }
-    }
-
-    #[test]
-    fn get_insert_e() {
-        let mut trie = Trie::new_temp();
-        trie.insert(vec![0x00], vec![0x00]).unwrap();
-        trie.insert(vec![0xC8], vec![0xC8]).unwrap();
-        trie.insert(vec![0xC8, 0x00], vec![0xC8, 0x00]).unwrap();
-
-        assert_eq!(trie.get(&vec![0x00]).unwrap(), Some(vec![0x00]));
-        assert_eq!(trie.get(&vec![0xC8]).unwrap(), Some(vec![0xC8]));
-        assert_eq!(trie.get(&vec![0xC8, 0x00]).unwrap(), Some(vec![0xC8, 0x00]));
-    }
-
-    #[test]
-    fn get_insert_f() {
-        let mut trie = Trie::new_temp();
-        trie.insert(vec![0x00], vec![0x00]).unwrap();
-        trie.insert(vec![0x01], vec![0x01]).unwrap();
-        trie.insert(vec![0x10], vec![0x10]).unwrap();
-        trie.insert(vec![0x19], vec![0x19]).unwrap();
-        trie.insert(vec![0x19, 0x00], vec![0x19, 0x00]).unwrap();
-        trie.insert(vec![0x1A], vec![0x1A]).unwrap();
-
-        assert_eq!(trie.get(&vec![0x00]).unwrap(), Some(vec![0x00]));
-        assert_eq!(trie.get(&vec![0x01]).unwrap(), Some(vec![0x01]));
-        assert_eq!(trie.get(&vec![0x10]).unwrap(), Some(vec![0x10]));
-        assert_eq!(trie.get(&vec![0x19]).unwrap(), Some(vec![0x19]));
-        assert_eq!(trie.get(&vec![0x19, 0x00]).unwrap(), Some(vec![0x19, 0x00]));
-        assert_eq!(trie.get(&vec![0x1A]).unwrap(), Some(vec![0x1A]));
-    }
-
-    #[test]
-    fn get_insert_remove_a() {
-        let mut trie = Trie::new_temp();
-        trie.insert(b"do".to_vec(), b"verb".to_vec()).unwrap();
-        trie.insert(b"horse".to_vec(), b"stallion".to_vec())
-            .unwrap();
-        trie.insert(b"doge".to_vec(), b"coin".to_vec()).unwrap();
-        trie.remove(&b"horse".to_vec()).unwrap();
-        assert_eq!(trie.get(&b"do".to_vec()).unwrap(), Some(b"verb".to_vec()));
-        assert_eq!(trie.get(&b"doge".to_vec()).unwrap(), Some(b"coin".to_vec()));
-    }
-
-    #[test]
-    fn get_insert_remove_b() {
-        let mut trie = Trie::new_temp();
-        trie.insert(vec![185], vec![185]).unwrap();
-        trie.insert(vec![185, 0], vec![185, 0]).unwrap();
-        trie.insert(vec![185, 1], vec![185, 1]).unwrap();
-        trie.remove(&vec![185, 1]).unwrap();
-        assert_eq!(trie.get(&vec![185, 0]).unwrap(), Some(vec![185, 0]));
-        assert_eq!(trie.get(&vec![185]).unwrap(), Some(vec![185]));
-        assert!(trie.get(&vec![185, 1]).unwrap().is_none());
-    }
-
-    #[test]
-    fn compute_hash_a() {
-        let mut trie = Trie::new_temp();
-        trie.insert(b"do".to_vec(), b"verb".to_vec()).unwrap();
-        trie.insert(b"horse".to_vec(), b"stallion".to_vec())
-            .unwrap();
-        trie.insert(b"doge".to_vec(), b"coin".to_vec()).unwrap();
-        trie.insert(b"dog".to_vec(), b"puppy".to_vec()).unwrap();
-
-        assert_eq!(
-            trie.hash().unwrap().0.as_slice(),
-            hex!("5991bb8c6514148a29db676a14ac506cd2cd5775ace63c30a4fe457715e9ac84").as_slice()
-        );
-    }
-
-    #[test]
-    fn compute_hash_b() {
-        let mut trie = Trie::new_temp();
-        assert_eq!(
-            trie.hash().unwrap().0.as_slice(),
-            hex!("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").as_slice(),
-        );
-    }
-
-    #[test]
-    fn compute_hash_c() {
-        let mut trie = Trie::new_temp();
-        let data = [
-            (
-                hex!("0000000000000000000000000000000000000000000000000000000000000045").to_vec(),
-                hex!("22b224a1420a802ab51d326e29fa98e34c4f24ea").to_vec(),
-            ),
-            (
-                hex!("0000000000000000000000000000000000000000000000000000000000000046").to_vec(),
-                hex!("67706c2076330000000000000000000000000000000000000000000000000000").to_vec(),
-            ),
-            (
-                hex!("000000000000000000000000697c7b8c961b56f675d570498424ac8de1a918f6").to_vec(),
-                hex!("1234567890").to_vec(),
-            ),
-            (
-                hex!("0000000000000000000000007ef9e639e2733cb34e4dfc576d4b23f72db776b2").to_vec(),
-                hex!("4655474156000000000000000000000000000000000000000000000000000000").to_vec(),
-            ),
-            (
-                hex!("000000000000000000000000ec4f34c97e43fbb2816cfd95e388353c7181dab1").to_vec(),
-                hex!("4e616d6552656700000000000000000000000000000000000000000000000000").to_vec(),
-            ),
-            (
-                hex!("4655474156000000000000000000000000000000000000000000000000000000").to_vec(),
-                hex!("7ef9e639e2733cb34e4dfc576d4b23f72db776b2").to_vec(),
-            ),
-            (
-                hex!("4e616d6552656700000000000000000000000000000000000000000000000000").to_vec(),
-                hex!("ec4f34c97e43fbb2816cfd95e388353c7181dab1").to_vec(),
-            ),
-            (
-                hex!("000000000000000000000000697c7b8c961b56f675d570498424ac8de1a918f6").to_vec(),
-                hex!("6f6f6f6820736f2067726561742c207265616c6c6c793f000000000000000000").to_vec(),
-            ),
-            (
-                hex!("6f6f6f6820736f2067726561742c207265616c6c6c793f000000000000000000").to_vec(),
-                hex!("697c7b8c961b56f675d570498424ac8de1a918f6").to_vec(),
-            ),
-        ];
-
-        for (path, value) in data {
-            trie.insert(path, value).unwrap();
-        }
-
-        assert_eq!(
-            trie.hash().unwrap().0.as_slice(),
-            hex!("9f6221ebb8efe7cff60a716ecb886e67dd042014be444669f0159d8e68b42100").as_slice(),
-        );
-    }
-
-    #[test]
-    fn compute_hash_d() {
-        let mut trie = Trie::new_temp();
-
-        let data = [
-            (
-                b"key1aa".to_vec(),
-                b"0123456789012345678901234567890123456789xxx".to_vec(),
-            ),
-            (
-                b"key1".to_vec(),
-                b"0123456789012345678901234567890123456789Very_Long".to_vec(),
-            ),
-            (b"key2bb".to_vec(), b"aval3".to_vec()),
-            (b"key2".to_vec(), b"short".to_vec()),
-            (b"key3cc".to_vec(), b"aval3".to_vec()),
-            (
-                b"key3".to_vec(),
-                b"1234567890123456789012345678901".to_vec(),
-            ),
-        ];
-
-        for (path, value) in data {
-            trie.insert(path, value).unwrap();
-        }
-
-        assert_eq!(
-            trie.hash().unwrap().0.as_slice(),
-            hex!("cb65032e2f76c48b82b5c24b3db8f670ce73982869d38cd39a624f23d62a9e89").as_slice(),
-        );
-    }
-
-    #[test]
-    fn compute_hash_e() {
-        let mut trie = Trie::new_temp();
-        trie.insert(b"abc".to_vec(), b"123".to_vec()).unwrap();
-        trie.insert(b"abcd".to_vec(), b"abcd".to_vec()).unwrap();
-        trie.insert(b"abc".to_vec(), b"abc".to_vec()).unwrap();
-
-        assert_eq!(
-            trie.hash().unwrap().0.as_slice(),
-            hex!("7a320748f780ad9ad5b0837302075ce0eeba6c26e3d8562c67ccc0f1b273298a").as_slice(),
-        );
-    }
-
-    // Proptests
-    proptest! {
-        #[test]
-        fn proptest_get_insert(data in btree_set(vec(any::<u8>(), 1..100), 1..100)) {
-            let mut trie = Trie::new_temp();
-
-            for val in data.iter(){
-                trie.insert(val.clone(), val.clone()).unwrap();
-            }
-
-            for val in data.iter() {
-                let item = trie.get(val).unwrap();
-                prop_assert!(item.is_some());
-                prop_assert_eq!(&item.unwrap(), val);
-            }
-        }
-
-        #[test]
-        fn proptest_get_insert_with_removals(mut data in vec((vec(any::<u8>(), 5..100), any::<bool>()), 1..100)) {
-            let mut trie = Trie::new_temp();
-            // Remove duplicate values with different expected status
-            data.sort_by_key(|(val, _)| val.clone());
-            data.dedup_by_key(|(val, _)| val.clone());
-            // Insertions
-            for (val, _) in data.iter() {
-                trie.insert(val.clone(), val.clone()).unwrap();
-            }
-            // Removals
-            for (val, should_remove) in data.iter() {
-                if *should_remove {
-                    let removed = trie.remove(val).unwrap();
-                    prop_assert_eq!(removed, Some(val.clone()));
-                }
-            }
-            // Check trie values
-            for (val, removed) in data.iter() {
-                let item = trie.get(val).unwrap();
-                if !removed {
-                    prop_assert_eq!(item, Some(val.clone()));
-                } else {
-                    prop_assert!(item.is_none());
-                }
-            }
-        }
-
-        #[test]
-        // The previous test needs to sort the input values in order to get rid of duplicate entries, leading to ordered insertions
-        // This check has a fixed way of determining whether a value should be removed but doesn't require ordered insertions
-        fn proptest_get_insert_with_removals_unsorted(data in btree_set(vec(any::<u8>(), 5..100), 1..100)) {
-            let mut trie = Trie::new_temp();
-            // Remove all values that have an odd first value
-            let remove = |value: &Vec<u8>| -> bool {
-                value.first().is_some_and(|v| v % 2 != 0)
-            };
-            // Insertions
-            for val in data.iter() {
-                trie.insert(val.clone(), val.clone()).unwrap();
-            }
-            // Removals
-            for val in data.iter() {
-                if remove(val) {
-                    let removed = trie.remove(&val.clone()).unwrap();
-                    prop_assert_eq!(removed, Some(val.clone()));
-                }
-            }
-            // Check trie values
-            for val in data.iter() {
-                let item = trie.get(val).unwrap();
-                if !remove(val) {
-                    prop_assert_eq!(item, Some(val.clone()));
-                } else {
-                    prop_assert!(item.is_none());
-                }
-            }
-        }
-
-        #[test]
-        fn proptest_compare_hash(data in btree_set(vec(any::<u8>(), 1..100), 1..100)) {
-            let mut trie = Trie::new_temp();
-            let mut cita_trie = cita_trie();
-
-            for val in data.iter(){
-                trie.insert(val.clone(), val.clone()).unwrap();
-                cita_trie.insert(val.clone(), val.clone()).unwrap();
-            }
-
-            let hash = trie.hash().unwrap().0.to_vec();
-            let cita_hash = cita_trie.root().unwrap();
-            prop_assert_eq!(hash, cita_hash);
-        }
-
-        #[test]
-        fn proptest_compare_hash_with_removals(mut data in vec((vec(any::<u8>(), 5..100), any::<bool>()), 1..100)) {
-            let mut trie = Trie::new_temp();
-            let mut cita_trie = cita_trie();
-            // Remove duplicate values with different expected status
-            data.sort_by_key(|(val, _)| val.clone());
-            data.dedup_by_key(|(val, _)| val.clone());
-            // Insertions
-            for (val, _) in data.iter() {
-                trie.insert(val.clone(), val.clone()).unwrap();
-                cita_trie.insert(val.clone(), val.clone()).unwrap();
-            }
-            // Removals
-            for (val, should_remove) in data.iter() {
-                if *should_remove {
-                    trie.remove(val).unwrap();
-                    cita_trie.remove(val).unwrap();
-                }
-            }
-            // Compare hashes
-            let hash = trie.hash().unwrap().0.to_vec();
-            let cita_hash = cita_trie.root().unwrap();
-            prop_assert_eq!(hash, cita_hash);
-        }
-
-        #[test]
-        // The previous test needs to sort the input values in order to get rid of duplicate entries, leading to ordered insertions
-        // This check has a fixed way of determining whether a value should be removed but doesn't require ordered insertions
-        fn proptest_compare_hash_with_removals_unsorted(data in btree_set(vec(any::<u8>(), 5..100), 1..100)) {
-            let mut trie = Trie::new_temp();
-            let mut cita_trie = cita_trie();
-            // Remove all values that have an odd first value
-            let remove = |value: &Vec<u8>| -> bool {
-                value.first().is_some_and(|v| v % 2 != 0)
-            };
-            // Insertions
-            for val in data.iter() {
-                trie.insert(val.clone(), val.clone()).unwrap();
-                cita_trie.insert(val.clone(), val.clone()).unwrap();
-            }
-            // Removals
-            for val in data.iter() {
-                if remove(val) {
-                    trie.remove(val).unwrap();
-                    cita_trie.remove(val).unwrap();
-                }
-            }
-            // Compare hashes
-            let hash = trie.hash().unwrap().0.to_vec();
-            let cita_hash = cita_trie.root().unwrap();
-            prop_assert_eq!(hash, cita_hash);
-        }
-
-        #[test]
-        fn proptest_compare_hash_between_inserts(data in btree_set(vec(any::<u8>(), 1..100), 1..100)) {
-            let mut trie = Trie::new_temp();
-            let mut cita_trie = cita_trie();
-
-            for val in data.iter(){
-                trie.insert(val.clone(), val.clone()).unwrap();
-                cita_trie.insert(val.clone(), val.clone()).unwrap();
-                let hash = trie.hash().unwrap().0.to_vec();
-                let cita_hash = cita_trie.root().unwrap();
-                prop_assert_eq!(hash, cita_hash);
-            }
-
-        }
-
-        #[test]
-        fn proptest_compare_proof(data in btree_set(vec(any::<u8>(), 1..100), 1..100)) {
-            let mut trie = Trie::new_temp();
-            let mut cita_trie = cita_trie();
-
-            for val in data.iter(){
-                trie.insert(val.clone(), val.clone()).unwrap();
-                cita_trie.insert(val.clone(), val.clone()).unwrap();
-            }
-            let _ = cita_trie.root();
-            for val in data.iter(){
-                let proof = trie.get_proof(val).unwrap();
-                let cita_proof = cita_trie.get_proof(val).unwrap();
-                prop_assert_eq!(proof, cita_proof);
-            }
-        }
-
-        #[test]
-        fn proptest_compare_proof_with_removals(mut data in vec((vec(any::<u8>(), 5..100), any::<bool>()), 1..100)) {
-            let mut trie = Trie::new_temp();
-            let mut cita_trie = cita_trie();
-            // Remove duplicate values with different expected status
-            data.sort_by_key(|(val, _)| val.clone());
-            data.dedup_by_key(|(val, _)| val.clone());
-            // Insertions
-            for (val, _) in data.iter() {
-                trie.insert(val.clone(), val.clone()).unwrap();
-                cita_trie.insert(val.clone(), val.clone()).unwrap();
-            }
-            // Removals
-            for (val, should_remove) in data.iter() {
-                if *should_remove {
-                    trie.remove(val).unwrap();
-                    cita_trie.remove(val).unwrap();
-                }
-            }
-            // Compare proofs
-            let _ = cita_trie.root();
-            for (val, _) in data.iter() {
-                let proof = trie.get_proof(val).unwrap();
-                let cita_proof = cita_trie.get_proof(val).unwrap();
-                prop_assert_eq!(proof, cita_proof);
-            }
-        }
-
-        #[test]
-        // The previous test needs to sort the input values in order to get rid of duplicate entries, leading to ordered insertions
-        // This check has a fixed way of determining whether a value should be removed but doesn't require ordered insertions
-        fn proptest_compare_proof_with_removals_unsorted(data in btree_set(vec(any::<u8>(), 5..100), 1..100)) {
-            let mut trie = Trie::new_temp();
-            let mut cita_trie = cita_trie();
-            // Remove all values that have an odd first value
-            let remove = |value: &Vec<u8>| -> bool {
-                value.first().is_some_and(|v| v % 2 != 0)
-            };
-            // Insertions
-            for val in data.iter() {
-                trie.insert(val.clone(), val.clone()).unwrap();
-                cita_trie.insert(val.clone(), val.clone()).unwrap();
-            }
-            // Removals
-            for val in data.iter() {
-                if remove(val) {
-                    trie.remove(val).unwrap();
-                    cita_trie.remove(val).unwrap();
-                }
-            }
-            // Compare proofs
-            let _ = cita_trie.root();
-            for val in data.iter() {
-                let proof = trie.get_proof(val).unwrap();
-                let cita_proof = cita_trie.get_proof(val).unwrap();
-                prop_assert_eq!(proof, cita_proof);
-            }
-        }
-
-    }
-
-    fn cita_trie() -> CitaTrie<CitaMemoryDB, HasherKeccak> {
-        let memdb = Arc::new(CitaMemoryDB::new(true));
-        let hasher = Arc::new(HasherKeccak::new());
-
-        CitaTrie::new(Arc::clone(&memdb), Arc::clone(&hasher))
-    }
-
-    #[test]
-    fn get_proof_one_leaf() {
-        // Trie -> Leaf["duck"]
-        let mut cita_trie = cita_trie();
-        let mut trie = Trie::new_temp();
-        cita_trie
-            .insert(b"duck".to_vec(), b"duckling".to_vec())
-            .unwrap();
-        trie.insert(b"duck".to_vec(), b"duckling".to_vec()).unwrap();
-        let cita_proof = cita_trie.get_proof(b"duck".as_ref()).unwrap();
-        let trie_proof = trie.get_proof(&b"duck".to_vec()).unwrap();
-        assert_eq!(cita_proof, trie_proof);
-    }
-
-    #[test]
-    fn get_proof_two_leaves() {
-        // Trie -> Extension[Branch[Leaf["duck"] Leaf["goose"]]]
-        let mut cita_trie = cita_trie();
-        let mut trie = Trie::new_temp();
-        cita_trie
-            .insert(b"duck".to_vec(), b"duck".to_vec())
-            .unwrap();
-        cita_trie
-            .insert(b"goose".to_vec(), b"goose".to_vec())
-            .unwrap();
-        trie.insert(b"duck".to_vec(), b"duck".to_vec()).unwrap();
-        trie.insert(b"goose".to_vec(), b"goose".to_vec()).unwrap();
-        let _ = cita_trie.root();
-        let cita_proof = cita_trie.get_proof(b"duck".as_ref()).unwrap();
-        let trie_proof = trie.get_proof(&b"duck".to_vec()).unwrap();
-        assert_eq!(cita_proof, trie_proof);
-    }
-
-    #[test]
-    fn get_proof_one_big_leaf() {
-        // Trie -> Leaf[[0,0,0,0,0,0,0,0,0,0,0,0,0,0]]
-        let val = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let mut cita_trie = cita_trie();
-        let mut trie = Trie::new_temp();
-        cita_trie.insert(val.clone(), val.clone()).unwrap();
-        trie.insert(val.clone(), val.clone()).unwrap();
-        let _ = cita_trie.root();
-        let cita_proof = cita_trie.get_proof(&val).unwrap();
-        let trie_proof = trie.get_proof(&val).unwrap();
-        assert_eq!(cita_proof, trie_proof);
-    }
-
-    #[test]
-    fn get_proof_path_in_branch() {
-        // Trie -> Extension[Branch[ [Leaf[[183,0,0,0,0,0]]], [183]]]
-        let mut cita_trie = cita_trie();
-        let mut trie = Trie::new_temp();
-        cita_trie.insert(vec![183], vec![183]).unwrap();
-        cita_trie
-            .insert(vec![183, 0, 0, 0, 0, 0], vec![183, 0, 0, 0, 0, 0])
-            .unwrap();
-        trie.insert(vec![183], vec![183]).unwrap();
-        trie.insert(vec![183, 0, 0, 0, 0, 0], vec![183, 0, 0, 0, 0, 0])
-            .unwrap();
-        let _ = cita_trie.root();
-        let cita_proof = cita_trie.get_proof(&[183]).unwrap();
-        let trie_proof = trie.get_proof(&vec![183]).unwrap();
-        assert_eq!(cita_proof, trie_proof);
-    }
-
-    #[test]
-    fn get_proof_removed_value() {
-        let a = vec![5, 0, 0, 0, 0];
-        let b = vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let mut cita_trie = cita_trie();
-        let mut trie = Trie::new_temp();
-        cita_trie.insert(a.clone(), a.clone()).unwrap();
-        cita_trie.insert(b.clone(), b.clone()).unwrap();
-        trie.insert(a.clone(), a.clone()).unwrap();
-        trie.insert(b.clone(), b.clone()).unwrap();
-        trie.remove(&a).unwrap();
-        cita_trie.remove(&a).unwrap();
-        let _ = cita_trie.root();
-        let cita_proof = cita_trie.get_proof(&a).unwrap();
-        let trie_proof = trie.get_proof(&a).unwrap();
-        assert_eq!(cita_proof, trie_proof);
+    fn empty_trie_hash_matches_keccak() {
+        assert_eq!(EMPTY_TRIE_HASH, H256(keccak_hash([RLP_NULL])));
     }
 }

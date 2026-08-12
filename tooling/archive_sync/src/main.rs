@@ -5,17 +5,17 @@ lazy_static::lazy_static! {
 use clap::{ArgGroup, Parser};
 use ethrex::initializers::open_store;
 use ethrex::utils::{default_datadir, init_datadir};
-use ethrex_common::types::BlockHash;
+use ethrex_common::types::{BlockHash, Code};
 use ethrex_common::utils::keccak;
 use ethrex_common::{Address, serde_utils};
 use ethrex_common::{BigEndianHash, Bytes, H256, U256, types::BlockNumber};
 use ethrex_common::{
-    constants::{EMPTY_KECCACK_HASH, EMPTY_TRIE_HASH},
+    constants::{EMPTY_KECCAK_HASH, EMPTY_TRIE_HASH},
     types::{AccountState, Block},
 };
 use ethrex_rlp::decode::RLPDecode;
 use ethrex_rlp::encode::RLPEncode;
-use ethrex_rpc::clients::auth::RpcResponse;
+use ethrex_rpc::utils::RpcResponse;
 use ethrex_storage::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -145,9 +145,12 @@ async fn process_dump(dump: Dump, store: Store, current_root: H256) -> eyre::Res
             dump_account.get_account_state().encode_to_vec(),
         )?;
         // Add code to DB if it is not empty
-        if dump_account.code_hash != *EMPTY_KECCACK_HASH {
+        if dump_account.code_hash != *EMPTY_KECCAK_HASH {
             store
-                .add_account_code(dump_account.code_hash, dump_account.code.clone())
+                .add_account_code(Code::from_bytecode(
+                    dump_account.code.clone(),
+                    &ethrex_crypto::NativeCrypto,
+                ))
                 .await?;
         }
         // Process storage trie if it is not empty
@@ -163,7 +166,7 @@ async fn process_dump(dump: Dump, store: Store, current_root: H256) -> eyre::Res
     for res in storage_tasks.join_all().await {
         res?;
     }
-    Ok(state_trie.hash()?)
+    Ok(state_trie.hash(&ethrex_crypto::NativeCrypto)?)
 }
 
 async fn process_dump_storage(
@@ -177,7 +180,7 @@ async fn process_dump_storage(
         // The key we receive is the preimage of the one stored in the trie
         trie.insert(keccak(key.0).0.to_vec(), val.encode_to_vec())?;
     }
-    if trie.hash()? != storage_root {
+    if trie.hash(&ethrex_crypto::NativeCrypto)? != storage_root {
         Err(eyre::ErrReport::msg(
             "Storage root doesn't match the one in the account during archive sync",
         ))
@@ -333,7 +336,7 @@ impl DumpProcessor {
 
             store.add_block(block).await?;
             store
-                .forkchoice_update(Some(block_hashes), block_number, block_hash, None, None)
+                .forkchoice_update(block_hashes, block_number, block_hash, None, None)
                 .await?;
             info!("Head of local chain is now block {block_number} with hash {block_hash}");
         }
@@ -738,7 +741,7 @@ pub async fn main() -> eyre::Result<()> {
     tracing::subscriber::set_global_default(FmtSubscriber::new())
         .expect("setting default subscriber failed");
     init_datadir(&args.datadir);
-    let store = open_store(&args.datadir);
+    let store = open_store(&args.datadir).expect("Failed to open Store");
     archive_sync(
         args.ipc_path,
         args.block_number,

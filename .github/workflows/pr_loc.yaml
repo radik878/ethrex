@@ -5,7 +5,14 @@ on:
     branches: ["**"]
 
 permissions:
+  contents: read
+  issues: write
   pull-requests: write
+
+env:
+  # Work around frequent libgit2/submodule fetch flakiness in CI.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
 
 jobs:
   report-loc-changes:
@@ -15,7 +22,7 @@ jobs:
     if: github.event.pull_request.head.repo.fork == false
     steps:
       - name: Checkout PR Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -31,7 +38,7 @@ jobs:
           echo "merge_base=$MERGE_BASE" >> $GITHUB_OUTPUT
       
       - name: Checkout merge base commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ steps.find_merge_base.outputs.merge_base }}
@@ -39,6 +46,7 @@ jobs:
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
         with:
+          cache-pool: l1
           components: rustfmt, clippy
 
       - name: Run Lines of Code Counter for base
@@ -49,7 +57,7 @@ jobs:
         run: mv tooling/loc/current_detailed_loc_report.json tooling/loc/previous_detailed_loc_report.json
 
       - name: Checkout PR
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           clean: "false" # Don't clean the workspace, so we can keep the previous report
           ref: ${{ github.event.pull_request.head.sha }}
@@ -57,6 +65,7 @@ jobs:
       - name: Setup Rust Environment
         uses: ./.github/actions/setup-rust
         with:
+          cache-pool: l1
           components: rustfmt, clippy
 
       - name: Run Lines of Code Counter for PR
@@ -80,7 +89,7 @@ jobs:
       - name: Find comment
         if: steps.check_report.outputs.report_exists == 'true'
         continue-on-error: true
-        uses: peter-evans/find-comment@v3
+        uses: peter-evans/find-comment@v4
         id: fc
         with:
           issue-number: ${{ github.event.pull_request.number }}
@@ -89,7 +98,7 @@ jobs:
 
       - name: Create Comment
         if: steps.check_report.outputs.report_exists == 'true'
-        uses: peter-evans/create-or-update-comment@v4
+        uses: peter-evans/create-or-update-comment@v5
         with:
           comment-id: ${{ steps.fc.outputs.comment-id }}
           token: ${{ secrets.GITHUB_TOKEN }}

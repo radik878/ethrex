@@ -1,23 +1,23 @@
-use std::collections::BTreeMap;
-use std::fmt;
-use std::str::FromStr;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::types::Block;
-use crate::{
-    H160,
-    constants::EMPTY_KECCACK_HASH,
-    types::{AccountState, AccountUpdate, BlockHeader, ChainConfig},
-    utils::{decode_hex, keccak},
-};
 use bytes::Bytes;
+
+use crate::rkyv_utils::H256Wrapper;
+use crate::serde_utils;
+use crate::types::{Block, Code, CodeMetadata};
+use crate::utils::keccak;
+use crate::{
+    constants::EMPTY_KECCAK_HASH,
+    types::{AccountState, AccountUpdate, BlockHeader, ChainConfig},
+};
 use ethereum_types::{Address, H256, U256};
+use ethrex_crypto::{Crypto, NativeCrypto};
+use ethrex_rlp::error::RLPDecodeError;
+use ethrex_rlp::structs::{Decoder, Encoder};
 use ethrex_rlp::{decode::RLPDecode, encode::RLPEncode};
-use ethrex_trie::{NodeRLP, Trie};
-use rkyv::{Archive, Deserialize as RDeserialize, Serialize as RSerialize};
-use serde::de::{SeqAccess, Visitor};
-use serde::ser::SerializeSeq;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
-use sha3::{Digest, Keccak256};
+use ethrex_trie::{EMPTY_TRIE_HASH, FxHashMap, Nibbles, Node, NodeRef, Trie, TrieError};
+use rkyv::with::{Identity, MapKV};
+use serde::{Deserialize, Serialize};
 
 /// State produced by the guest program execution inside the zkVM. It is
 /// essentially built from the `ExecutionWitness`.
@@ -26,15 +26,10 @@ use sha3::{Digest, Keccak256};
 /// built on-demand during the stateless validation.
 /// This struct must be instantiated, filled, and consumed inside the zkVM.
 pub struct GuestProgramState {
-    /// Map of node hash to RLP-encoded node.
-    /// This is computed during guest program execution inside the zkVM,
-    /// before the stateless validation.
-    /// It is used to rebuild the state trie and storage tries.
-    pub nodes_hashed: BTreeMap<H256, NodeRLP>,
     /// Map of code hashes to their corresponding bytecode.
     /// This is computed during guest program execution inside the zkVM,
     /// before the stateless validation.
-    pub codes_hashed: BTreeMap<H256, Vec<u8>>,
+    pub codes_hashed: BTreeMap<H256, Code>,
     /// Map of block numbers to their corresponding block headers.
     /// The block headers are pushed to the zkVM RLP-encoded, and then
     /// decoded and stored in this map during guest program execution,
@@ -42,24 +37,24 @@ pub struct GuestProgramState {
     pub block_headers: BTreeMap<u64, BlockHeader>,
     /// The accounts state trie containing the necessary state for the guest
     /// program execution.
-    /// The trie is built during guest program execution inside the zkVM,
-    /// before the stateless validation.
-    pub state_trie: Option<Trie>,
+    pub state_trie: Trie,
     /// The parent block header of the first block in the batch.
     pub parent_block_header: BlockHeader,
     /// The block number of the first block in the batch.
     pub first_block_number: u64,
     /// The chain configuration.
     pub chain_config: ChainConfig,
-    /// Map of account addresses to their corresponding storage tries.
-    /// This struct is initialized empty inside the zkVM and storage tries are
-    /// built on-demand and cached here during guest program execution.
-    pub storage_tries: BTreeMap<Address, Trie>,
+    /// Map of hashed addresses to their corresponding storage tries.
+    pub storage_tries: BTreeMap<H256, Trie>,
     /// Map of account addresses to their corresponding hashed addresses.
     /// This is a convenience map to avoid recomputing the hashed address
     /// multiple times during guest program execution.
     /// It is built on-demand during guest program execution, inside the zkVM.
-    pub account_hashes_by_address: BTreeMap<Address, Vec<u8>>,
+    pub account_hashes_by_address: BTreeMap<Address, H256>,
+    /// Map of hashed addresses to booleans, indicating whose account's storage tries were
+    /// verified.
+    /// Verification is done by hashing the trie and comparing the root hash with the account's storage root.
+    pub verified_storage_roots: BTreeMap<H256, bool>,
 }
 
 /// Witness data produced by the client and consumed by the guest program
@@ -67,8 +62,9 @@ pub struct GuestProgramState {
 ///
 /// It is essentially an `RpcExecutionWitness` but it also contains `ChainConfig`,
 /// and `first_block_number`.
-#[derive(Serialize, Deserialize, Default, RSerialize, RDeserialize, Archive, Clone)]
-#[serde(rename_all = "camelCase")]
+#[derive(
+    Default, Serialize, Deserialize, rkyv::Serialize, rkyv::Deserialize, rkyv::Archive, Clone,
+)]
 pub struct ExecutionWitness {
     // Contract bytecodes needed for stateless execution.
     #[rkyv(with = crate::rkyv_utils::VecVecWrapper)]
@@ -80,13 +76,433 @@ pub struct ExecutionWitness {
     pub first_block_number: u64,
     // The chain config.
     pub chain_config: ChainConfig,
-    /// RLP-encoded trie nodes needed for stateless execution.
-    #[rkyv(with = crate::rkyv_utils::VecVecWrapper)]
-    pub nodes: Vec<Vec<u8>>,
-    /// Flattened map of account addresses and storage keys whose values
-    /// are needed for stateless execution.
-    #[rkyv(with = crate::rkyv_utils::VecVecWrapper)]
-    pub keys: Vec<Vec<u8>>,
+    /// Root node embedded with the rest of the trie's nodes
+    pub state_trie_root: Option<Node>,
+    /// Root nodes per account storage embedded with the rest of the trie's nodes,
+    /// keyed by the keccak256 hash of the account address.
+    #[rkyv(with = MapKV<H256Wrapper, Identity>)]
+    pub storage_trie_roots: BTreeMap<H256, Node>,
+}
+
+/// RPC-friendly representation of an execution witness.
+///
+/// This is the format returned by the `debug_executionWitness` RPC method.
+/// The trie nodes are pre-serialized (via `encode_subtrie`) to avoid
+/// expensive traversal on every RPC request.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RpcExecutionWitness {
+    #[serde(
+        serialize_with = "serde_utils::bytes::vec::serialize",
+        deserialize_with = "serde_utils::bytes::vec::deserialize"
+    )]
+    pub state: Vec<Bytes>,
+    #[serde(
+        default,
+        serialize_with = "serde_utils::bytes::vec::serialize",
+        deserialize_with = "serde_utils::bytes::vec::deserialize"
+    )]
+    pub keys: Vec<Bytes>,
+    #[serde(
+        serialize_with = "serde_utils::bytes::vec::serialize",
+        deserialize_with = "serde_utils::bytes::vec::deserialize"
+    )]
+    pub codes: Vec<Bytes>,
+    #[serde(
+        serialize_with = "serde_utils::bytes::vec::serialize",
+        deserialize_with = "serde_utils::bytes::vec::deserialize"
+    )]
+    pub headers: Vec<Bytes>,
+}
+
+impl TryFrom<ExecutionWitness> for RpcExecutionWitness {
+    type Error = TrieError;
+
+    fn try_from(value: ExecutionWitness) -> Result<Self, Self::Error> {
+        let mut nodes = Vec::new();
+        if let Some(state_trie_root) = value.state_trie_root {
+            state_trie_root.encode_subtrie(&mut nodes)?;
+        }
+        for node in value.storage_trie_roots.values() {
+            node.encode_subtrie(&mut nodes)?;
+        }
+        // Canonical witness ordering (EIP-8025, geth `ExtWitness`): state nodes
+        // and codes sorted lexicographically and deduplicated (identical
+        // storage subtries would otherwise emit identical nodes twice); headers
+        // ascending by block number and deduplicated (the same ancestor header
+        // can be referenced by more than one block).
+        nodes.sort();
+        nodes.dedup();
+        let mut codes = value.codes;
+        codes.sort();
+        codes.dedup();
+        let mut headers = value.block_headers_bytes;
+        headers.sort_by_cached_key(|bytes| {
+            // Undecodable headers sort last; consumers reject them on decode anyway.
+            BlockHeader::decode(bytes)
+                .map(|header| header.number)
+                .unwrap_or(u64::MAX)
+        });
+        // Identical headers share a block number, so they are now adjacent.
+        headers.dedup();
+        Ok(Self {
+            state: nodes.into_iter().map(Bytes::from).collect(),
+            keys: Vec::new(),
+            codes: codes.into_iter().map(Bytes::from).collect(),
+            headers: headers.into_iter().map(Bytes::from).collect(),
+        })
+    }
+}
+
+/// Geth's `ExtWitness` wire shape, returned by
+/// `engine_newPayloadWithWitness*`: an RLP list of
+/// `(headers, codes, state, keys)`, with headers ascending by block number
+/// and code/state byte lists sorted lexicographically. Geth currently emits
+/// empty `keys`, but the trailing field is part of the RLP shape.
+/// Reference:
+/// https://github.com/ethereum/go-ethereum/blob/4daaaadfc4706b0a49d4dfde3559de7be968c28a/core/stateless/encoding.go#L30-L52
+#[derive(Debug, Clone)]
+pub struct ExtWitness {
+    pub headers: Vec<BlockHeader>,
+    pub codes: Vec<Bytes>,
+    pub state: Vec<Bytes>,
+    pub keys: Vec<Bytes>,
+}
+
+impl RLPEncode for ExtWitness {
+    fn encode(&self, buf: &mut dyn bytes::BufMut) {
+        Encoder::new(buf)
+            .encode_field(&self.headers)
+            .encode_field(&self.codes)
+            .encode_field(&self.state)
+            .encode_field(&self.keys)
+            .finish();
+    }
+}
+
+impl RLPDecode for ExtWitness {
+    fn decode_unfinished(rlp: &[u8]) -> Result<(Self, &[u8]), RLPDecodeError> {
+        let decoder = Decoder::new(rlp)?;
+        let (headers, decoder) = decoder.decode_field("headers")?;
+        let (codes, decoder) = decoder.decode_field("codes")?;
+        let (state, decoder) = decoder.decode_field("state")?;
+        let (keys, decoder) = decoder.decode_field("keys")?;
+        let remaining = decoder.finish()?;
+        Ok((
+            ExtWitness {
+                headers,
+                codes,
+                state,
+                keys,
+            },
+            remaining,
+        ))
+    }
+}
+
+impl RpcExecutionWitness {
+    /// Convert an RPC execution witness into the internal [`ExecutionWitness`]
+    /// format by rebuilding trie structures from the flat node list.
+    /// `decoded_headers` is reused (typically from [`decode_witness_headers`])
+    /// to avoid a second RLP decode.
+    pub fn into_execution_witness(
+        self,
+        chain_config: ChainConfig,
+        first_block_number: u64,
+        decoded_headers: &[BlockHeader],
+        crypto: &dyn Crypto,
+    ) -> Result<ExecutionWitness, GuestProgramStateError> {
+        let initial_state_root = find_parent_state_root(decoded_headers, first_block_number)?;
+        // Drop the `0x80` Null-node sentinel some `debug_executionWitness` producers emit.
+        // Undecodable/unused nodes are dropped per EELS
+        // `test_validation_state_extra_unused_trie_node`; missing needed nodes surface
+        // later as `RootNotFound` from `get_embedded_root_committed`.
+        let nodes: FxHashMap<H256, Node> = self
+            .state
+            .into_iter()
+            .filter_map(|b| {
+                if b == Bytes::from_static(&[0x80]) {
+                    return None;
+                }
+                let node = Node::decode(&b).ok()?;
+                Some((H256(crypto.keccak256(&b)), node))
+            })
+            .collect();
+
+        // get state trie root and embed the rest of the trie into it
+        let state_trie_root = if let NodeRef::Node(state_trie_root, _) =
+            Trie::get_embedded_root_committed(&nodes, initial_state_root, crypto)?
+        {
+            Some((*state_trie_root).clone())
+        } else {
+            None
+        };
+
+        // Walk the state trie to discover accounts and their storage roots,
+        // instead of relying on the keys field which is being removed from the RPC spec.
+        let mut storage_trie_roots = BTreeMap::new();
+        if let Some(state_trie_root) = &state_trie_root {
+            let mut accounts = Vec::new();
+            collect_accounts_from_trie(
+                state_trie_root,
+                Nibbles::from_raw(&[], false),
+                &mut accounts,
+                &nodes,
+                crypto,
+            );
+
+            for (hashed_address, storage_root_hash) in accounts {
+                if storage_root_hash == EMPTY_TRIE_HASH {
+                    continue;
+                }
+                if !nodes.contains_key(&storage_root_hash) {
+                    continue;
+                }
+                let node = Trie::get_embedded_root_committed(&nodes, storage_root_hash, crypto)?;
+                let NodeRef::Node(node, _) = node else {
+                    return Err(GuestProgramStateError::Custom(
+                        "execution witness does not contain non-empty storage trie".to_string(),
+                    ));
+                };
+                storage_trie_roots.insert(hashed_address, (*node).clone());
+            }
+        }
+
+        Ok(ExecutionWitness {
+            codes: self.codes.into_iter().map(|b| b.to_vec()).collect(),
+            chain_config,
+            first_block_number,
+            block_headers_bytes: self.headers.into_iter().map(|b| b.to_vec()).collect(),
+            state_trie_root,
+            storage_trie_roots,
+        })
+    }
+}
+
+impl ExecutionWitness {
+    /// Build an `ExecutionWitness` from an SSZ stateless input. Used by the
+    /// stateless validator (EXECUTE precompile and zkVM guest program).
+    ///
+    /// `first_block_number` is taken from the payload's block number, and
+    /// `initial_state_root` is recovered by finding the parent header
+    /// (`number == first_block_number - 1`) among the witness headers — same
+    /// convention as `RpcExecutionWitness::into_execution_witness`.
+    ///
+    /// The `ChainConfig` is derived from the SSZ `active_fork` via
+    /// `ssz_chain_config_to_internal` — every fork up to the active one is
+    /// activated at timestamp 0 (native-L2 genesis activation).
+    pub fn from_ssz(
+        input: &crate::types::stateless_ssz::SszStatelessInput,
+    ) -> Result<Self, GuestProgramStateError> {
+        let first_block_number = input.new_payload_request.execution_payload.block_number;
+
+        let mut initial_state_root = None;
+        for h in input.witness.headers.iter() {
+            let header_bytes: Vec<u8> = h.iter().copied().collect();
+            let header = BlockHeader::decode(&header_bytes)?;
+            if header.number == first_block_number.saturating_sub(1) {
+                initial_state_root = Some(header.state_root);
+                break;
+            }
+        }
+        let initial_state_root = initial_state_root.ok_or_else(|| {
+            GuestProgramStateError::Custom(format!(
+                "header for block {} not found",
+                first_block_number.saturating_sub(1)
+            ))
+        })?;
+
+        let (state_trie_root, storage_trie_roots) =
+            rebuild_state_and_storage_tries(input.witness.state_as_vecs(), initial_state_root)?;
+
+        Ok(Self {
+            codes: input.witness.codes_as_vecs(),
+            block_headers_bytes: input.witness.headers_as_vecs(),
+            first_block_number,
+            chain_config: ssz_chain_config_to_internal(&input.chain_config)?,
+            state_trie_root,
+            storage_trie_roots,
+        })
+    }
+}
+
+/// Rebuild the embedded state trie and per-account storage tries from a flat
+/// list of trie-node preimages (same format as `debug_executionWitness.state`
+/// and SSZ `ExecutionWitness.state`).
+fn rebuild_state_and_storage_tries<I, B>(
+    state_bytes: I,
+    initial_state_root: H256,
+) -> Result<(Option<Node>, BTreeMap<H256, Node>), GuestProgramStateError>
+where
+    I: IntoIterator<Item = B>,
+    B: AsRef<[u8]>,
+{
+    let nodes: BTreeMap<H256, Node> = state_bytes
+        .into_iter()
+        .filter_map(|b| {
+            let bytes = b.as_ref();
+            // Some implementations of debug_executionWitness emit a `Null`
+            // node (single byte 0x80) which would fail RLP decode here.
+            if bytes == [0x80] {
+                return None;
+            }
+            let hash = keccak(bytes);
+            Some(Node::decode(bytes).map(|node| (hash, node)))
+        })
+        .collect::<Result<_, RLPDecodeError>>()?;
+
+    // Get state trie root with the rest of the trie embedded into it.
+    let state_trie_root = if let NodeRef::Node(state_trie_root, _) =
+        Trie::get_embedded_root(&nodes, initial_state_root)?
+    {
+        Some((*state_trie_root).clone())
+    } else {
+        None
+    };
+
+    // Walk the state trie to discover accounts and their storage roots,
+    // instead of relying on the keys field which is being removed from the
+    // RPC spec.
+    let mut storage_trie_roots = BTreeMap::new();
+    if let Some(root) = &state_trie_root {
+        let accounts = collect_accounts_from_embedded_trie(root, &nodes, &NativeCrypto);
+        for (hashed_address, storage_root_hash) in accounts {
+            if storage_root_hash == EMPTY_TRIE_HASH || !nodes.contains_key(&storage_root_hash) {
+                continue;
+            }
+            let node = Trie::get_embedded_root(&nodes, storage_root_hash)?;
+            let NodeRef::Node(node, _) = node else {
+                return Err(GuestProgramStateError::Custom(
+                    "execution witness does not contain non-empty storage trie".to_string(),
+                ));
+            };
+            storage_trie_roots.insert(hashed_address, (*node).clone());
+        }
+    }
+
+    Ok((state_trie_root, storage_trie_roots))
+}
+
+/// RLP-decode the raw header byte slices into a `Vec<BlockHeader>`.
+pub fn decode_witness_headers<B: AsRef<[u8]>>(
+    headers_bytes: &[B],
+) -> Result<Vec<BlockHeader>, GuestProgramStateError> {
+    headers_bytes
+        .iter()
+        .map(|b| BlockHeader::decode(b.as_ref()).map_err(GuestProgramStateError::from))
+        .collect()
+}
+
+/// Locate the parent block's state root from a slice of decoded headers.
+/// Returns an error if `first_block_number == 0` (no parent possible) or if the
+/// parent header is not in the slice.
+fn find_parent_state_root(
+    headers: &[BlockHeader],
+    first_block_number: u64,
+) -> Result<H256, GuestProgramStateError> {
+    let parent_number = first_block_number
+        .checked_sub(1)
+        .ok_or(GuestProgramStateError::Custom(
+            "first_block_number must be > 0 (need parent header)".to_string(),
+        ))?;
+    headers
+        .iter()
+        .find(|h| h.number == parent_number)
+        .map(|h| h.state_root)
+        .ok_or_else(|| {
+            GuestProgramStateError::Custom(format!("header for block {parent_number} not found"))
+        })
+}
+
+/// Check that `headers[1..]` link via `parent_hash == keccak(RLP(prev))` AND
+/// `number == prev.number + 1`, in input order. The first header is
+/// intentionally unanchored here; the parent end is bound by the post-execution
+/// state-root check in `execute_blocks`.
+///
+/// Call before any sort/dedup, since reordering hides violations.
+pub fn validate_witness_headers_chain(
+    headers: &[BlockHeader],
+    crypto: &dyn Crypto,
+) -> Result<(), GuestProgramStateError> {
+    for pair in headers.windows(2) {
+        let (prev, next) = (&pair[0], &pair[1]);
+        if prev.number.checked_add(1) != Some(next.number)
+            || next.parent_hash != prev.compute_block_hash(crypto)
+        {
+            return Err(GuestProgramStateError::NoncontiguousBlockHeaders);
+        }
+    }
+    Ok(())
+}
+
+/// Recursively walks an embedded state trie node and collects
+/// `(hashed_address, storage_root)` pairs from leaf nodes.
+fn collect_accounts_from_trie(
+    node: &Node,
+    path: Nibbles,
+    accounts: &mut Vec<(H256, H256)>,
+    nodes: &FxHashMap<H256, Node>,
+    crypto: &dyn Crypto,
+) {
+    match node {
+        Node::Branch(branch) => {
+            for (i, child) in branch.choices.iter().enumerate() {
+                let child_node: Option<&Node> = match child {
+                    NodeRef::Node(n, _) => Some(n),
+                    NodeRef::Hash(hash) if hash.is_valid() => nodes.get(&hash.finalize(crypto)),
+                    _ => None,
+                };
+                if let Some(child_node) = child_node {
+                    collect_accounts_from_trie(
+                        child_node,
+                        path.append_new(i as u8),
+                        accounts,
+                        nodes,
+                        crypto,
+                    );
+                }
+            }
+        }
+        Node::Extension(ext) => {
+            let child_node: Option<&Node> = match &ext.child {
+                NodeRef::Node(n, _) => Some(n),
+                NodeRef::Hash(hash) if hash.is_valid() => nodes.get(&hash.finalize(crypto)),
+                _ => None,
+            };
+            if let Some(child_node) = child_node {
+                collect_accounts_from_trie(
+                    child_node,
+                    path.concat(&ext.prefix),
+                    accounts,
+                    nodes,
+                    crypto,
+                );
+            }
+        }
+        Node::Leaf(leaf) => {
+            let full_path = path.concat(&leaf.partial);
+            let path_bytes = full_path.to_bytes();
+            if path_bytes.len() == 32 {
+                let hashed_address = H256::from_slice(&path_bytes);
+                match AccountState::decode(&leaf.value) {
+                    Ok(account_state) => {
+                        accounts.push((hashed_address, account_state.storage_root));
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            ?hashed_address,
+                            error = %e,
+                            "Skipping leaf with un-decodable account state"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    path_len = path_bytes.len(),
+                    "Skipping leaf with unexpected path length (expected 32)"
+                );
+            }
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -101,18 +517,25 @@ pub enum GuestProgramStateError {
     NoBlockHeaders,
     #[error("Parent block header of block {0} was not found")]
     MissingParentHeaderOf(u64),
-    #[error("Non-contiguous block headers (there's a gap in the block headers list)")]
+    #[error("Non-contiguous block headers")]
     NoncontiguousBlockHeaders,
+    #[error("Bytecode for code hash {0} was not found in witness")]
+    MissingBytecode(H256),
+    #[error("Trie error: {0}")]
+    Trie(#[from] TrieError),
+    #[error("RLP Decode: {0}")]
+    RLPDecode(#[from] RLPDecodeError),
     #[error("Unreachable code reached: {0}")]
     Unreachable(String),
     #[error("Custom error: {0}")]
     Custom(String),
 }
 
-impl TryFrom<ExecutionWitness> for GuestProgramState {
-    type Error = GuestProgramStateError;
-
-    fn try_from(value: ExecutionWitness) -> Result<Self, Self::Error> {
+impl GuestProgramState {
+    pub fn from_witness(
+        value: ExecutionWitness,
+        crypto: &dyn Crypto,
+    ) -> Result<Self, GuestProgramStateError> {
         let block_headers: BTreeMap<u64, BlockHeader> = value
             .block_headers_bytes
             .into_iter()
@@ -137,129 +560,87 @@ impl TryFrom<ExecutionWitness> for GuestProgramState {
             GuestProgramStateError::MissingParentHeaderOf(value.first_block_number),
         )?;
 
-        // hash nodes
-        let nodes_hashed = value
-            .nodes
-            .into_iter()
-            .map(|node| {
-                let node = node.to_vec();
-                (keccak(&node), node)
-            })
-            .collect();
+        // hash state trie nodes
+        let state_trie = if let Some(state_trie_root) = value.state_trie_root {
+            Trie::new_temp_with_root(state_trie_root.into())
+        } else {
+            Trie::new_temp()
+        };
+        state_trie.hash_no_commit(crypto);
+
+        let mut storage_tries = BTreeMap::new();
+        for (hashed_address, storage_trie_root) in value.storage_trie_roots {
+            // hash storage trie nodes
+            let storage_trie = Trie::new_temp_with_root(storage_trie_root.into());
+            storage_trie.hash_no_commit(crypto);
+            storage_tries.insert(hashed_address, storage_trie);
+        }
 
         // hash codes
+        // TODO: codes here probably needs to be Vec<Code>, rather than recomputing here. This requires rkyv implementation.
         let codes_hashed = value
             .codes
             .into_iter()
-            .map(|code| (keccak(&code), code))
+            .map(|code| {
+                let code = Code::from_bytecode(code.into(), crypto);
+                (code.hash, code)
+            })
             .collect();
 
-        let mut guest_program_state = GuestProgramState {
+        Ok(GuestProgramState {
             codes_hashed,
-            state_trie: None,
-            storage_tries: BTreeMap::new(),
+            state_trie,
+            storage_tries,
             block_headers,
             parent_block_header: parent_header,
             first_block_number: value.first_block_number,
             chain_config: value.chain_config,
-            nodes_hashed,
             account_hashes_by_address: BTreeMap::new(),
-        };
-
-        guest_program_state.rebuild_state_trie().map_err(|_| {
-            GuestProgramStateError::RebuildTrie(
-                "Failed to rebuild state trie from execution witness".to_owned(),
-            )
-        })?;
-
-        Ok(guest_program_state)
+            verified_storage_roots: BTreeMap::new(),
+        })
     }
 }
 
 impl GuestProgramState {
-    /// Use the state nodes to build the state trie and store them in `self.state_trie`
-    /// This function will fail if the state trie cannot be rebuilt.
-    pub fn rebuild_state_trie(&mut self) -> Result<(), GuestProgramStateError> {
-        if self.state_trie.is_some() {
-            return Ok(());
-        }
-
-        let state_trie = Trie::from_nodes(self.parent_block_header.state_root, &self.nodes_hashed)
-            .map_err(|e| {
-                GuestProgramStateError::RebuildTrie(format!("Failed to build state trie {e}"))
-            })?;
-
-        self.state_trie = Some(state_trie);
-
-        Ok(())
-    }
-
-    /// Helper function to rebuild the storage trie for a given account address
-    /// Returns if root is not empty, an Option with the rebuilt trie
-    // This function is an option because we expect it to fail sometimes, and we just want to filter it
-    pub fn rebuild_storage_trie(&mut self, address: &H160) -> Option<Trie> {
-        let account_hash = self
-            .account_hashes_by_address
-            .entry(*address)
-            .or_insert_with(|| hash_address(address));
-
-        let account_state_rlp = self.state_trie.as_ref()?.get(account_hash).ok()??;
-
-        let account_state = AccountState::decode(&account_state_rlp).ok()?;
-
-        Trie::from_nodes(account_state.storage_root, &self.nodes_hashed).ok()
-    }
-
     /// Helper function to apply account updates to the execution witness
     /// It updates the state trie and storage tries with the given account updates
     /// Returns an error if the updates cannot be applied
     pub fn apply_account_updates(
         &mut self,
         account_updates: &[AccountUpdate],
+        crypto: &dyn Crypto,
     ) -> Result<(), GuestProgramStateError> {
-        let (Some(state_trie), storage_tries) = (self.state_trie.as_mut(), &mut self.storage_tries)
-        else {
-            return Err(GuestProgramStateError::ApplyAccountUpdates(
-                "Tried to apply account updates before rebuilding the tries".to_string(),
-            ));
-        };
-
         for update in account_updates.iter() {
-            let hashed_address = self
+            let hashed_address = *self
                 .account_hashes_by_address
                 .entry(update.address)
-                .or_insert_with(|| hash_address(&update.address));
+                .or_insert_with(|| hash_address(&update.address, crypto));
 
             if update.removed {
                 // Remove account from trie
-                state_trie
-                    .remove(hashed_address)
-                    .expect("failed to remove from trie");
+                self.state_trie.remove(hashed_address.as_bytes())?;
             } else {
                 // Add or update AccountState in the trie
                 // Fetch current state or create a new state to be inserted
-                let mut account_state = match state_trie
-                    .get(hashed_address)
-                    .expect("failed to get account state from trie")
-                {
-                    Some(encoded_state) => AccountState::decode(&encoded_state)
-                        .expect("failed to decode account state"),
+                let mut account_state = match self.state_trie.get(hashed_address.as_bytes())? {
+                    Some(encoded_state) => AccountState::decode(&encoded_state)?,
                     None => AccountState::default(),
                 };
+                if update.removed_storage {
+                    account_state.storage_root = EMPTY_TRIE_HASH;
+                }
                 if let Some(info) = &update.info {
                     account_state.nonce = info.nonce;
                     account_state.balance = info.balance;
                     account_state.code_hash = info.code_hash;
                     // Store updated code in DB
                     if let Some(code) = &update.code {
-                        self.codes_hashed.insert(info.code_hash, code.to_vec());
+                        self.codes_hashed.insert(info.code_hash, code.clone());
                     }
                 }
                 // Store the added storage in the account's storage trie and compute its new root
                 if !update.added_storage.is_empty() {
-                    let storage_trie = storage_tries
-                        .entry(update.address)
-                        .or_insert_with(Trie::empty_in_memory);
+                    let storage_trie = self.storage_tries.entry(hashed_address).or_default();
 
                     // Inserts must come before deletes, otherwise deletes might require extra nodes
                     // Example:
@@ -268,27 +649,25 @@ impl GuestProgramState {
                     let (deletes, inserts): (Vec<_>, Vec<_>) = update
                         .added_storage
                         .iter()
-                        .map(|(k, v)| (hash_key(k), v))
+                        .map(|(k, v)| (hash_key(k, crypto), v))
                         .partition(|(_k, v)| v.is_zero());
 
                     for (hashed_key, storage_value) in inserts {
-                        storage_trie
-                            .insert(hashed_key, storage_value.encode_to_vec())
-                            .expect("failed to insert in trie");
+                        storage_trie.insert(hashed_key, storage_value.encode_to_vec())?;
                     }
 
                     for (hashed_key, _) in deletes {
-                        storage_trie
-                            .remove(&hashed_key)
-                            .expect("failed to remove key");
+                        storage_trie.remove(&hashed_key)?;
                     }
 
-                    account_state.storage_root = storage_trie.hash_no_commit();
+                    let storage_root = storage_trie.hash_no_commit(crypto);
+                    account_state.storage_root = storage_root;
                 }
 
-                state_trie
-                    .insert(hashed_address.clone(), account_state.encode_to_vec())
-                    .expect("failed to insert into storage");
+                self.state_trie.insert(
+                    hashed_address.as_bytes().to_vec(),
+                    account_state.encode_to_vec(),
+                )?;
             }
         }
         Ok(())
@@ -296,15 +675,8 @@ impl GuestProgramState {
 
     /// Returns the root hash of the state trie
     /// Returns an error if the state trie is not built yet
-    pub fn state_trie_root(&self) -> Result<H256, GuestProgramStateError> {
-        let state_trie = self
-            .state_trie
-            .as_ref()
-            .ok_or(GuestProgramStateError::RebuildTrie(
-                "Tried to get state trie root before rebuilding tries".to_string(),
-            ))?;
-
-        Ok(state_trie.hash_no_commit())
+    pub fn state_trie_root(&self, crypto: &dyn Crypto) -> Result<H256, GuestProgramStateError> {
+        Ok(self.state_trie.hash_no_commit(crypto))
     }
 
     /// Returns Some(block_number) if the hash for block_number is not the parent
@@ -312,7 +684,10 @@ impl GuestProgramState {
     ///
     /// Keep in mind that the last block hash (which is a batch's parent hash)
     /// can't be validated against the next header, because it has no successor.
-    pub fn get_first_invalid_block_hash(&self) -> Result<Option<u64>, GuestProgramStateError> {
+    pub fn get_first_invalid_block_hash(
+        &self,
+        crypto: &dyn Crypto,
+    ) -> Result<Option<u64>, GuestProgramStateError> {
         // Enforces there's at least one block header, so windows() call doesn't panic.
         if self.block_headers.is_empty() {
             return Err(GuestProgramStateError::NoBlockHeaders);
@@ -336,7 +711,7 @@ impl GuestProgramState {
                 return Err(GuestProgramStateError::NoncontiguousBlockHeaders);
             }
 
-            if next_header.parent_hash != header.hash() {
+            if next_header.parent_hash != header.compute_block_hash(crypto) {
                 return Ok(Some(*number));
             }
         }
@@ -356,25 +731,27 @@ impl GuestProgramState {
     }
 
     /// Retrieves the account state from the state trie.
-    /// Returns an error if the state trie is not rebuilt or if decoding the account state fails.
+    /// Returns an error if decoding the account state fails.
     pub fn get_account_state(
         &mut self,
         address: Address,
+        crypto: &dyn Crypto,
     ) -> Result<Option<AccountState>, GuestProgramStateError> {
-        let state_trie = self
-            .state_trie
-            .as_ref()
-            .ok_or(GuestProgramStateError::Database(
-                "ExecutionWitness: Tried to get state trie before rebuilding tries".to_string(),
-            ))?;
-
-        let hashed_address = self
+        let hashed_address = *self
             .account_hashes_by_address
             .entry(address)
-            .or_insert_with(|| hash_address(&address));
+            .or_insert_with(|| hash_address(&address, crypto));
 
-        let Ok(Some(encoded_state)) = state_trie.get(hashed_address) else {
-            return Ok(None);
+        let encoded_state = match self.state_trie.get(hashed_address.as_bytes()) {
+            // The witness proves the account is absent.
+            Ok(None) => return Ok(None),
+            Ok(Some(encoded_state)) => encoded_state,
+            // A missing trie node means the witness lacks the proof needed to
+            // resolve this account. Surface it as an error rather than silently
+            // treating the account as absent, otherwise a read of an unmodified
+            // account (e.g. a failed CALL's target) would pass replay against an
+            // incomplete witness (EIP-8025 `witness_validation_state` tests).
+            Err(e) => return Err(GuestProgramStateError::Database(e.to_string())),
         };
         let state = AccountState::decode(&encoded_state).map_err(|_| {
             GuestProgramStateError::Database("Failed to get decode account from trie".to_string())
@@ -385,10 +762,14 @@ impl GuestProgramState {
 
     /// Fetches the block hash for a specific block number.
     /// Looks up `self.block_headers` and computes the hash if it is not already computed.
-    pub fn get_block_hash(&self, block_number: u64) -> Result<H256, GuestProgramStateError> {
+    pub fn get_block_hash(
+        &self,
+        block_number: u64,
+        crypto: &dyn Crypto,
+    ) -> Result<H256, GuestProgramStateError> {
         self.block_headers
             .get(&block_number)
-            .map(|header| header.hash())
+            .map(|header| header.compute_block_hash(crypto))
             .ok_or_else(|| {
                 GuestProgramStateError::Database(format!(
                     "Block hash not found for block number {block_number}"
@@ -397,31 +778,16 @@ impl GuestProgramState {
     }
 
     /// Retrieves a storage slot value for an account in its storage trie.
-    ///
-    /// Lazily builds the storage trie for the address if not already available.
-    /// This lazy loading approach minimizes memory usage by only building tries when needed.
     pub fn get_storage_slot(
         &mut self,
         address: Address,
         key: H256,
+        crypto: &dyn Crypto,
     ) -> Result<Option<U256>, GuestProgramStateError> {
-        let storage_trie = if let Some(storage_trie) = self.storage_tries.get(&address) {
-            storage_trie
-        } else {
-            if self.state_trie.is_none() {
-                return Err(GuestProgramStateError::Database(
-                    "ExecutionWitness: Tried to get storage slot before rebuilding state trie."
-                        .to_string(),
-                ));
-            };
-
-            let Some(storage_trie) = self.rebuild_storage_trie(&address) else {
-                return Ok(None);
-            };
-
-            self.storage_tries.entry(address).or_insert(storage_trie)
+        let hashed_key = hash_key(&key, crypto);
+        let Some(storage_trie) = self.get_valid_storage_trie(address, crypto)? else {
+            return Ok(None);
         };
-        let hashed_key = hash_key(&key);
         if let Some(encoded_key) = storage_trie
             .get(&hashed_key)
             .map_err(|e| GuestProgramStateError::Database(e.to_string()))?
@@ -442,138 +808,379 @@ impl GuestProgramState {
     }
 
     /// Retrieves the account code for a specific account.
-    /// Returns an Err if the code is not found.
-    pub fn get_account_code(
-        &self,
-        code_hash: H256,
-    ) -> Result<bytes::Bytes, GuestProgramStateError> {
-        if code_hash == *EMPTY_KECCACK_HASH {
-            return Ok(Bytes::new());
+    ///
+    /// A missing code hash is always an error: ethrex's own witness producers
+    /// include every byte of code the VM reads, and EIP-8025 stateless
+    /// validation requires the same.
+    pub fn get_account_code(&self, code_hash: H256) -> Result<Code, GuestProgramStateError> {
+        if code_hash == *EMPTY_KECCAK_HASH {
+            return Ok(Code::default());
         }
-        match self.codes_hashed.get(&code_hash) {
-            Some(code) => Ok(Bytes::copy_from_slice(code)),
-            None => {
-                // We do this because what usually happens is that the Witness doesn't have the code we asked for but it is because it isn't relevant for that particular case.
-                // In client implementations there are differences and it's natural for some clients to access more/less information in some edge cases.
-                // Sidenote: logger doesn't work inside SP1, that's why we use println!
-                println!(
-                    "Missing bytecode for hash {} in witness. Defaulting to empty code.", // If there's a state root mismatch and this prints we have to see if it's the cause or not.
-                    hex::encode(code_hash)
-                );
-                Ok(Bytes::new())
-            }
-        }
+        self.codes_hashed
+            .get(&code_hash)
+            .cloned()
+            .ok_or(GuestProgramStateError::MissingBytecode(code_hash))
     }
 
-    /// Hashes headers in witness and in blocks only once if they are repeated to avoid double hashing.
+    /// Retrieves code metadata (length) for a specific code hash.
+    /// This is an optimized path for EXTCODESIZE opcode.
+    pub fn get_code_metadata(
+        &self,
+        code_hash: H256,
+    ) -> Result<CodeMetadata, GuestProgramStateError> {
+        if code_hash == *EMPTY_KECCAK_HASH {
+            return Ok(CodeMetadata { length: 0 });
+        }
+        self.codes_hashed
+            .get(&code_hash)
+            .map(|code| CodeMetadata {
+                length: code.len() as u64,
+            })
+            .ok_or(GuestProgramStateError::MissingBytecode(code_hash))
+    }
+
+    /// When executing multiple blocks in the L2 it happens that the headers in block_headers correspond to the same block headers that we have in the blocks array. The main goal is to hash these only once and set them in both places.
+    /// We also initialize the remaining block headers hashes. If they are set, we check their validity.
     pub fn initialize_block_header_hashes(
         &self,
         blocks: &[Block],
+        crypto: &dyn Crypto,
     ) -> Result<(), GuestProgramStateError> {
-        // First we need to ensure that the block headers are initialized not before the guest program is executed
-        for header in self.block_headers.values() {
-            if header.hash.get().is_some() {
-                return Err(GuestProgramStateError::Custom(format!(
-                    "Block header hash is already set for {}",
-                    header.number
-                )));
-            }
-        }
-
-        // Now we initialize the block_headers hashes and check the remaining blocks hashes
+        let mut block_numbers_in_common = BTreeSet::new();
         for block in blocks {
-            // Verify each block's header hash is uninitialized
-            if block.header.hash.get().is_some() {
-                return Err(GuestProgramStateError::Custom(format!(
-                    "Block header hash is already set for {}",
-                    block.header.number
-                )));
-            }
-            let header = self
-                .block_headers
-                .get(&block.header.number)
-                .unwrap_or(&block.header);
+            let hash = block.header.compute_block_hash(crypto);
+            set_hash_or_validate(&block.header, hash)?;
 
-            let hash = header.hash();
-            // this returns err if it's already set, so we drop the Result as we don't
-            // care if it was already initialized.
-            let _ = block.header.hash.set(hash);
+            let number = block.header.number;
+            if let Some(header) = self.block_headers.get(&number) {
+                block_numbers_in_common.insert(number);
+                set_hash_or_validate(header, hash)?;
+            }
         }
+
+        for header in self.block_headers.values() {
+            if block_numbers_in_common.contains(&header.number) {
+                // We have already set this hash in the previous step
+                continue;
+            }
+            let hash = header.compute_block_hash(crypto);
+            set_hash_or_validate(header, hash)?;
+        }
+
         Ok(())
     }
-}
 
-pub fn serialize_code<S>(map: &BTreeMap<H256, Bytes>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let mut seq_serializer = serializer.serialize_seq(Some(map.len()))?;
-    for (code_hash, code) in map {
-        let code_hash = format!("0x{}", hex::encode(code_hash));
-        let code = format!("0x{}", hex::encode(code));
+    pub fn get_valid_storage_trie(
+        &mut self,
+        address: Address,
+        crypto: &dyn Crypto,
+    ) -> Result<Option<&Trie>, GuestProgramStateError> {
+        let hashed_address = *self
+            .account_hashes_by_address
+            .entry(address)
+            .or_insert_with(|| hash_address(&address, crypto));
 
-        let mut obj = serde_json::Map::new();
-        obj.insert(code_hash, serde_json::Value::String(code));
-
-        seq_serializer.serialize_element(&obj)?;
-    }
-    seq_serializer.end()
-}
-
-pub fn deserialize_code<'de, D>(deserializer: D) -> Result<BTreeMap<H256, Bytes>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct BytesVecVisitor;
-
-    impl<'de> Visitor<'de> for BytesVecVisitor {
-        type Value = BTreeMap<H256, Bytes>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a list of hex-encoded strings")
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: SeqAccess<'de>,
-        {
-            let mut map = BTreeMap::new();
-
-            #[derive(Deserialize)]
-            struct CodeEntry(BTreeMap<String, String>);
-
-            while let Some(CodeEntry(entry)) = seq.next_element::<CodeEntry>()? {
-                if entry.len() != 1 {
-                    return Err(de::Error::custom(
-                        "Each object must contain exactly one key",
-                    ));
+        let is_storage_verified = *self
+            .verified_storage_roots
+            .get(&hashed_address)
+            .unwrap_or(&false);
+        if is_storage_verified {
+            Ok(self.storage_tries.get(&hashed_address))
+        } else {
+            let Some(storage_root) = self
+                .get_account_state(address, crypto)?
+                .map(|a| a.storage_root)
+            else {
+                // empty account
+                return Ok(None);
+            };
+            let storage_trie = match self.storage_tries.get(&hashed_address) {
+                None if storage_root == EMPTY_TRIE_HASH => return Ok(None),
+                Some(trie) if trie.hash_no_commit(crypto) == storage_root => trie,
+                _ => {
+                    return Err(GuestProgramStateError::Custom(format!(
+                        "invalid storage trie for account {address}"
+                    )));
                 }
+            };
+            self.verified_storage_roots.insert(hashed_address, true);
+            Ok(Some(storage_trie))
+        }
+    }
+}
 
-                for (k, v) in entry {
-                    let code_hash =
-                        H256::from_str(k.trim_start_matches("0x")).map_err(de::Error::custom)?;
+/// Walk an embedded state trie and collect `(hashed_address, storage_root)` pairs
+/// from leaf nodes. Resolves `NodeRef::Hash` references using the flat `nodes` map.
+///
+/// BTreeMap-based counterpart of the `FxHashMap`-based `collect_accounts_from_trie`
+/// used by `into_execution_witness`; this one backs the SSZ `from_ssz` path.
+pub fn collect_accounts_from_embedded_trie(
+    root: &Node,
+    nodes: &BTreeMap<H256, Node>,
+    crypto: &dyn Crypto,
+) -> Vec<(H256, H256)> {
+    let mut accounts = Vec::new();
+    collect_accounts_from_node(root, Nibbles::default(), &mut accounts, nodes, crypto);
+    accounts
+}
 
-                    let bytecode =
-                        decode_hex(v.trim_start_matches("0x")).map_err(de::Error::custom)?;
+fn collect_accounts_from_node(
+    node: &Node,
+    path: ethrex_trie::Nibbles,
+    accounts: &mut Vec<(H256, H256)>,
+    nodes: &BTreeMap<H256, Node>,
+    crypto: &dyn Crypto,
+) {
+    use ethrex_trie::NodeRef;
 
-                    map.insert(code_hash, Bytes::from(bytecode));
+    match node {
+        Node::Branch(branch) => {
+            for (i, child) in branch.choices.iter().enumerate() {
+                let child_node: Option<&Node> = match child {
+                    NodeRef::Node(n, _) => Some(n),
+                    NodeRef::Hash(hash) if hash.is_valid() => nodes.get(&hash.finalize(crypto)),
+                    _ => None,
+                };
+                if let Some(child_node) = child_node {
+                    collect_accounts_from_node(
+                        child_node,
+                        path.append_new(i as u8),
+                        accounts,
+                        nodes,
+                        crypto,
+                    );
                 }
             }
-            Ok(map)
+        }
+        Node::Extension(ext) => {
+            let child_node: Option<&Node> = match &ext.child {
+                NodeRef::Node(n, _) => Some(n),
+                NodeRef::Hash(hash) if hash.is_valid() => nodes.get(&hash.finalize(crypto)),
+                _ => None,
+            };
+            if let Some(child_node) = child_node {
+                collect_accounts_from_node(
+                    child_node,
+                    path.concat(&ext.prefix),
+                    accounts,
+                    nodes,
+                    crypto,
+                );
+            }
+        }
+        Node::Leaf(leaf) => {
+            let full_path = path.concat(&leaf.partial);
+            let path_bytes = full_path.to_bytes();
+            if path_bytes.len() == 32 {
+                let hashed_address = H256::from_slice(&path_bytes);
+                match AccountState::decode(&leaf.value) {
+                    Ok(account_state) => {
+                        accounts.push((hashed_address, account_state.storage_root));
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            ?hashed_address,
+                            error = %e,
+                            "Skipping leaf with un-decodable account state"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    path_len = path_bytes.len(),
+                    "Skipping leaf with unexpected path length (expected 32)"
+                );
+            }
+        }
+    }
+}
+
+fn hash_address(address: &Address, crypto: &dyn Crypto) -> H256 {
+    H256(crypto.keccak256(&address.to_fixed_bytes()))
+}
+
+pub fn hash_key(key: &H256, crypto: &dyn Crypto) -> Vec<u8> {
+    crypto.keccak256(&key.to_fixed_bytes()).to_vec()
+}
+
+/// Initializes hash of header or validates the hash is correct in case it's already set
+/// Note that header doesn't need to be mutable because the hash is a OnceCell
+fn set_hash_or_validate(header: &BlockHeader, hash: H256) -> Result<(), GuestProgramStateError> {
+    // If it's already set the .set() method will return the current value
+    if let Err(prev_hash) = header.hash.set(hash)
+        && prev_hash != hash
+    {
+        return Err(GuestProgramStateError::Custom(format!(
+            "Block header hash was previously set for {} with the wrong value. It should be set correctly or left unset.",
+            header.number
+        )));
+    }
+    Ok(())
+}
+
+/// Map an ethrex `Fork` to its spec `PROTOCOL_FORKS` index (execution-specs 85fc20ca).
+fn fork_to_spec_index(fork: crate::types::genesis::Fork) -> Result<u64, GuestProgramStateError> {
+    use crate::types::genesis::Fork;
+    Ok(match fork {
+        Fork::Cancun => 16,
+        Fork::Prague => 17,
+        Fork::Osaka => 18,
+        Fork::Amsterdam => 24,
+        other => {
+            return Err(GuestProgramStateError::Custom(format!(
+                "fork {other:?} has no stateless spec fork index (native rollups run Cancun+)"
+            )));
+        }
+    })
+}
+
+/// Encode an ethrex `ChainConfig` into the SSZ `SszChainConfig` (with `active_fork`).
+/// The active fork is resolved at `block_timestamp`; the native L2 activates its
+/// forks at genesis, so `activation.timestamp = [0]`.
+pub fn chain_config_to_ssz(
+    cfg: &ChainConfig,
+    block_timestamp: u64,
+) -> Result<crate::types::stateless_ssz::SszChainConfig, GuestProgramStateError> {
+    use crate::types::stateless_ssz::{
+        SszBlobSchedule, SszChainConfig, SszForkActivation, SszForkConfig, SszOptionalBlobSchedule,
+        SszOptionalForkActivationValue,
+    };
+
+    let fork = cfg.get_fork(block_timestamp);
+    let fork_index = fork_to_spec_index(fork)?;
+
+    let mut timestamp: SszOptionalForkActivationValue = SszOptionalForkActivationValue::new();
+    timestamp
+        .push(0u64)
+        .map_err(|e| GuestProgramStateError::Custom(format!("activation ts push: {e:?}")))?;
+
+    let mut blob_schedule: SszOptionalBlobSchedule = SszOptionalBlobSchedule::new();
+    if let Some(bs) = cfg.get_fork_blob_schedule(block_timestamp) {
+        blob_schedule
+            .push(SszBlobSchedule {
+                target: bs.target as u64,
+                max: bs.max as u64,
+                base_fee_update_fraction: bs.base_fee_update_fraction,
+            })
+            .map_err(|e| GuestProgramStateError::Custom(format!("blob_schedule push: {e:?}")))?;
+    }
+
+    Ok(SszChainConfig {
+        chain_id: cfg.chain_id,
+        active_fork: SszForkConfig {
+            fork: fork_index,
+            activation: SszForkActivation {
+                block_number: SszOptionalForkActivationValue::new(),
+                timestamp,
+            },
+            blob_schedule,
+        },
+    })
+}
+
+/// Decode an `SszChainConfig` into an ethrex `ChainConfig`. Activates every fork
+/// up to and including the SSZ `active_fork` at timestamp 0 (native-L2 genesis
+/// activation). `blob_schedule` is left `Default` — L2 blocks carry no blobs, so
+/// it does not affect execution.
+pub fn ssz_chain_config_to_internal(
+    scc: &crate::types::stateless_ssz::SszChainConfig,
+) -> Result<ChainConfig, GuestProgramStateError> {
+    use crate::types::genesis::Fork;
+    let fork = match scc.active_fork.fork {
+        16 => Fork::Cancun,
+        17 => Fork::Prague,
+        18 => Fork::Osaka,
+        24 => Fork::Amsterdam,
+        other => {
+            return Err(GuestProgramStateError::Custom(format!(
+                "unknown/unsupported spec fork index {other}"
+            )));
+        }
+    };
+    Ok(ChainConfig {
+        chain_id: scc.chain_id,
+        homestead_block: Some(0),
+        eip150_block: Some(0),
+        eip155_block: Some(0),
+        eip158_block: Some(0),
+        byzantium_block: Some(0),
+        constantinople_block: Some(0),
+        petersburg_block: Some(0),
+        istanbul_block: Some(0),
+        berlin_block: Some(0),
+        london_block: Some(0),
+        terminal_total_difficulty: Some(0),
+        terminal_total_difficulty_passed: true,
+        shanghai_time: (fork >= Fork::Shanghai).then_some(0),
+        cancun_time: (fork >= Fork::Cancun).then_some(0),
+        prague_time: (fork >= Fork::Prague).then_some(0),
+        osaka_time: (fork >= Fork::Osaka).then_some(0),
+        amsterdam_time: (fork >= Fork::Amsterdam).then_some(0),
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
+mod active_fork_tests {
+    use super::*;
+    use crate::types::genesis::{ChainConfig, Fork};
+
+    fn prague_l2_config() -> ChainConfig {
+        ChainConfig {
+            chain_id: 1,
+            homestead_block: Some(0),
+            eip150_block: Some(0),
+            eip155_block: Some(0),
+            eip158_block: Some(0),
+            byzantium_block: Some(0),
+            constantinople_block: Some(0),
+            petersburg_block: Some(0),
+            istanbul_block: Some(0),
+            berlin_block: Some(0),
+            london_block: Some(0),
+            terminal_total_difficulty: Some(0),
+            terminal_total_difficulty_passed: true,
+            shanghai_time: Some(0),
+            cancun_time: Some(0),
+            prague_time: Some(0),
+            ..Default::default()
         }
     }
 
-    deserializer.deserialize_seq(BytesVecVisitor)
-}
+    #[test]
+    fn active_fork_round_trips_prague() {
+        let cfg = prague_l2_config();
+        let ssz = chain_config_to_ssz(&cfg, 0).expect("encode");
+        // Encodes the spec Prague index (17) at genesis activation.
+        assert_eq!(ssz.active_fork.fork, 17);
+        assert_eq!(ssz.chain_id, 1);
+        let back = ssz_chain_config_to_internal(&ssz).expect("decode");
+        // Fork rules reproduce: Prague active, Osaka/Amsterdam inactive.
+        assert_eq!(back.get_fork(0), Fork::Prague);
+        assert_eq!(back.chain_id, 1);
+        assert!(back.osaka_time.is_none());
+        assert!(back.amsterdam_time.is_none());
+    }
 
-fn hash_address(address: &Address) -> Vec<u8> {
-    Keccak256::new_with_prefix(address.to_fixed_bytes())
-        .finalize()
-        .to_vec()
-}
+    #[test]
+    fn active_fork_round_trips_cancun() {
+        let mut cfg = prague_l2_config();
+        cfg.prague_time = None; // Cancun-only L2
+        let ssz = chain_config_to_ssz(&cfg, 0).expect("encode");
+        assert_eq!(ssz.active_fork.fork, 16);
+        let back = ssz_chain_config_to_internal(&ssz).expect("decode");
+        assert_eq!(back.get_fork(0), Fork::Cancun);
+        assert!(back.prague_time.is_none());
+    }
 
-pub fn hash_key(key: &H256) -> Vec<u8> {
-    Keccak256::new_with_prefix(key.to_fixed_bytes())
-        .finalize()
-        .to_vec()
+    #[test]
+    fn active_fork_round_trips_amsterdam() {
+        let mut cfg = prague_l2_config();
+        cfg.osaka_time = Some(0);
+        cfg.amsterdam_time = Some(0);
+        let ssz = chain_config_to_ssz(&cfg, 0).expect("encode");
+        assert_eq!(ssz.active_fork.fork, 24); // spec Amsterdam index
+        let back = ssz_chain_config_to_internal(&ssz).expect("decode");
+        assert_eq!(back.get_fork(0), Fork::Amsterdam);
+    }
 }

@@ -1,10 +1,11 @@
 use bytes::Bytes;
 use ethrex_blockchain::vm::StoreVmDatabase;
-use ethrex_common::H256;
 use ethrex_common::{
     Address, U256,
-    types::{Account, EIP1559Transaction, Transaction, TxKind},
+    constants::EMPTY_TRIE_HASH,
+    types::{Account, BlockHeader, Code, EIP1559Transaction, Transaction, TxKind},
 };
+use ethrex_crypto::NativeCrypto;
 use ethrex_levm::errors::VMError;
 use ethrex_levm::{
     Environment,
@@ -15,7 +16,7 @@ use ethrex_levm::{
 };
 use ethrex_storage::Store;
 use ethrex_vm::DynVmDatabase;
-use std::collections::BTreeMap;
+use rustc_hash::FxHashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -29,13 +30,21 @@ pub fn run_with_levm(contract_code: &str, runs: u64, calldata: &str) {
 
     let mut db = init_db(bytecode);
 
+    // The tx is invariant across runs (the nonce lives in the env, not the tx), and the VM now
+    // borrows its tx (`&'a Transaction`), so build it once here and lend it to each VM.
+    let tx = Transaction::EIP1559Transaction(EIP1559Transaction {
+        to: TxKind::Call(Address::from_low_u64_be(CONTRACT_ADDRESS)),
+        data: calldata,
+        ..Default::default()
+    });
+
     // when using stateful execute() we have to use nonce when instantiating the vm. Otherwise use 0.
     for _nonce in 0..runs - 1 {
-        let mut vm = init_vm(&mut db, 0, calldata.clone()).unwrap();
+        let mut vm = init_vm(&mut db, 0, &tx).unwrap();
         let tx_report = black_box(vm.stateless_execute().unwrap());
         assert!(tx_report.is_success());
     }
-    let mut vm = init_vm(&mut db, 0, calldata.clone()).unwrap();
+    let mut vm = init_vm(&mut db, 0, &tx).unwrap();
     let tx_report = black_box(vm.stateless_execute().unwrap());
 
     assert!(tx_report.is_success(), "{:?}", tx_report.result);
@@ -53,23 +62,40 @@ pub fn run_with_levm(contract_code: &str, runs: u64, calldata: &str) {
 fn init_db(bytecode: Bytes) -> GeneralizedDatabase {
     // The store type for this bench shouldn't matter as all operations use the LEVM cache
     let in_memory_db = Store::new("", ethrex_storage::EngineType::InMemory).unwrap();
-    let store: DynVmDatabase = Box::new(StoreVmDatabase::new(in_memory_db, H256::zero()));
+    let header = BlockHeader {
+        state_root: *EMPTY_TRIE_HASH,
+        ..Default::default()
+    };
+    let store: DynVmDatabase = Box::new(StoreVmDatabase::new(in_memory_db, header).unwrap());
 
-    let cache = BTreeMap::from([
-        (
-            Address::from_low_u64_be(CONTRACT_ADDRESS),
-            Account::new(U256::MAX, bytecode.clone(), 0, BTreeMap::new()),
+    let mut cache = FxHashMap::default();
+    cache.insert(
+        Address::from_low_u64_be(CONTRACT_ADDRESS),
+        Account::new(
+            U256::MAX,
+            Code::from_bytecode(bytecode.clone(), &ethrex_crypto::NativeCrypto),
+            0,
+            FxHashMap::default(),
         ),
-        (
-            Address::from_low_u64_be(SENDER_ADDRESS),
-            Account::new(U256::MAX, Bytes::new(), 0, BTreeMap::new()),
+    );
+    cache.insert(
+        Address::from_low_u64_be(SENDER_ADDRESS),
+        Account::new(
+            U256::MAX,
+            Code::from_bytecode(Bytes::new(), &ethrex_crypto::NativeCrypto),
+            0,
+            FxHashMap::default(),
         ),
-    ]);
+    );
 
     GeneralizedDatabase::new_with_account_state(Arc::new(store), cache)
 }
 
-fn init_vm(db: &mut GeneralizedDatabase, nonce: u64, calldata: Bytes) -> Result<VM, VMError> {
+fn init_vm<'a>(
+    db: &'a mut GeneralizedDatabase,
+    nonce: u64,
+    tx: &'a Transaction,
+) -> Result<VM<'a>, VMError> {
     let env = Environment {
         origin: Address::from_low_u64_be(SENDER_ADDRESS),
         tx_nonce: nonce,
@@ -78,10 +104,13 @@ fn init_vm(db: &mut GeneralizedDatabase, nonce: u64, calldata: Bytes) -> Result<
         ..Default::default()
     };
 
-    let tx = Transaction::EIP1559Transaction(EIP1559Transaction {
-        to: TxKind::Call(Address::from_low_u64_be(CONTRACT_ADDRESS)),
-        data: calldata,
-        ..Default::default()
-    });
-    VM::new(env, db, &tx, LevmCallTracer::disabled(), VMType::L1)
+    VM::new(
+        env,
+        db,
+        tx,
+        LevmCallTracer::disabled(),
+        VMType::L1,
+        &NativeCrypto,
+        None,
+    )
 }

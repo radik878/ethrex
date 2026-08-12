@@ -1,14 +1,13 @@
 use crate::based::block_fetcher::BlockFetcherError;
-use crate::based::state_updater::StateUpdaterError;
 use crate::sequencer::admin_server::AdminError;
+use crate::sequencer::state_updater::StateUpdaterError;
 use crate::utils::error::UtilsError;
+use aligned_sdk::gateway::provider::GatewayError;
 use ethereum_types::FromStrRadixErr;
-use ethrex_blockchain::error::{ChainError, InvalidForkChoice};
-use ethrex_common::Address;
+use ethrex_blockchain::error::{ChainError, InvalidBlockError, InvalidForkChoice};
 use ethrex_common::types::{BlobsBundleError, FakeExponentialError};
 use ethrex_l2_common::privileged_transactions::PrivilegedTransactionError;
 use ethrex_l2_common::prover::ProverType;
-use ethrex_l2_common::state_diff::StateDiffError;
 use ethrex_l2_rpc::signer::SignerError;
 use ethrex_metrics::MetricsError;
 use ethrex_rpc::clients::EngineClientError;
@@ -16,7 +15,7 @@ use ethrex_rpc::clients::eth::errors::{CalldataEncodeError, EthClientError};
 use ethrex_storage::error::StoreError;
 use ethrex_storage_rollup::RollupStoreError;
 use ethrex_vm::EvmError;
-use spawned_concurrency::error::GenServerError;
+use spawned_concurrency::error::ActorError;
 use tokio::task::JoinError;
 
 #[derive(Debug, thiserror::Error)]
@@ -72,7 +71,7 @@ pub enum L1WatcherError {
     #[error("{0}")]
     Custom(String),
     #[error("Internal Error: {0}")]
-    InternalError(#[from] GenServerError),
+    InternalError(#[from] ActorError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,8 +106,6 @@ pub enum ProofCoordinatorError {
     InternalError(String),
     #[error("ProofCoordinator failed when (de)serializing JSON: {0}")]
     JsonError(#[from] serde_json::Error),
-    #[error("ProofCoordinator encountered a StateDiffError")]
-    StateDiffError(#[from] StateDiffError),
     #[error("ProofCoordinator encountered a ExecutionCacheError")]
     ExecutionCacheError(#[from] ExecutionCacheError),
     #[error("ProofCoordinator encountered a BlobsBundleError: {0}")]
@@ -121,6 +118,8 @@ pub enum ProofCoordinatorError {
     MissingTDXPrivateKey,
     #[error("Metrics error")]
     Metrics(#[from] MetricsError),
+    #[error("Missing prover input for batch {0} (version {1})")]
+    MissingBatchProverInput(u64, String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +128,8 @@ pub enum ProofSenderError {
     EthClientError(#[from] EthClientError),
     #[error("Failed to encode calldata: {0}")]
     CalldataEncodeError(#[from] CalldataEncodeError),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("{0} proof is not present")]
     ProofNotPresent(ProverType),
     #[error("Unexpected Error: {0}")]
@@ -136,19 +137,27 @@ pub enum ProofSenderError {
     #[error("Failed to parse OnChainProposer response: {0}")]
     FailedToParseOnChainProposerResponse(String),
     #[error("Internal Error: {0}")]
-    InternalError(#[from] GenServerError),
+    InternalError(#[from] ActorError),
     #[error("Proof Sender failed because of a rollup store error: {0}")]
     RollUpStoreError(#[from] RollupStoreError),
-    #[error("Proof Sender failed to estimate Aligned fee: {0}")]
-    AlignedFeeEstimateError(String),
-    #[error("Proof Sender failed to get nonce from batcher: {0}")]
+    #[error("Proof Sender failed to get nonce from gateway: {0}")]
     AlignedGetNonceError(String),
-    #[error("Proof Sender failed to submit proof: {0}")]
-    AlignedSubmitProofError(String),
+    #[error("Proof Sender failed to submit proof(s): {0:?}")]
+    AlignedSubmitProofError(GatewayError),
+    #[error("Wrong batch proof format; should be compressed but found groth16 instead")]
+    AlignedWrongProofFormat,
+    #[error("Aligned mode only supports SP1 proofs, got {0}")]
+    AlignedUnsupportedProverType(String),
     #[error("Metrics error")]
     Metrics(#[from] MetricsError),
     #[error("Failed to convert integer")]
     TryIntoError(#[from] std::num::TryFromIntError),
+}
+
+impl From<GatewayError> for ProofSenderError {
+    fn from(value: GatewayError) -> Self {
+        ProofSenderError::AlignedSubmitProofError(value)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +174,22 @@ pub enum ProofVerifierError {
     StoreError(#[from] StoreError),
     #[error("Block Producer failed because of a rollup store error: {0}")]
     RollupStoreError(#[from] RollupStoreError),
+    #[error("Aligned does not support prover type {0}")]
+    UnsupportedProverType(String),
+    #[error(
+        "Mismatched public inputs for batch {batch_number} and prover type {prover_type}. Existing: {existing_hex}, latest: {latest_hex}"
+    )]
+    MismatchedPublicInputs {
+        batch_number: u64,
+        prover_type: ProverType,
+        existing_hex: String,
+        latest_hex: String,
+    },
+    #[error("Missing public values for batch {batch_number} and prover type {prover_type}")]
+    MissingPublicValues {
+        batch_number: u64,
+        prover_type: ProverType,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -199,12 +224,20 @@ pub enum BlockProducerError {
     Custom(String),
     #[error("Failed to parse withdrawal: {0}")]
     FailedToParseWithdrawal(#[from] UtilsError),
-    #[error("Failed to encode AccountStateDiff: {0}")]
-    FailedToEncodeAccountStateDiff(#[from] StateDiffError),
     #[error("Failed to get data from: {0}")]
     FailedToGetDataFrom(String),
     #[error("Internal Error: {0}")]
-    InternalError(#[from] GenServerError),
+    InternalError(#[from] ActorError),
+    #[error("EthClientError error: {0}")]
+    EthClientError(#[from] EthClientError),
+    #[error("Failed to encode calldata: {0}")]
+    CalldataEncodeError(#[from] CalldataEncodeError),
+}
+
+impl From<InvalidBlockError> for BlockProducerError {
+    fn from(err: InvalidBlockError) -> Self {
+        BlockProducerError::ChainError(ChainError::from(err))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -213,7 +246,7 @@ pub enum CommitterError {
     EthClientError(#[from] EthClientError),
     #[error("Committer failed to  {0}")]
     FailedToParseLastCommittedBlock(#[from] FromStrRadixErr),
-    #[error("Committer failed retrieve block from storage: {0}")]
+    #[error("Committer Store Error: {0}")]
     StoreError(#[from] StoreError),
     #[error("Committer failed retrieve block from rollup storage: {0}")]
     RollupStoreError(#[from] RollupStoreError),
@@ -223,10 +256,8 @@ pub enum CommitterError {
     FailedToRetrieveDataFromStorage,
     #[error("Committer failed to generate blobs bundle: {0}")]
     FailedToGenerateBlobsBundle(#[from] BlobsBundleError),
-    #[error("Committer failed to get information from storage")]
+    #[error("Committer failed to get information from storage: {0}")]
     FailedToGetInformationFromStorage(String),
-    #[error("Committer failed to encode state diff: {0}")]
-    FailedToEncodeStateDiff(#[from] StateDiffError),
     #[error("Committer failed to open Points file: {0}")]
     FailedToOpenPointsFile(#[from] std::io::Error),
     #[error("Committer failed to re-execute block: {0}")]
@@ -252,7 +283,7 @@ pub enum CommitterError {
     #[error("Metrics error")]
     Metrics(#[from] MetricsError),
     #[error("Internal Error: {0}")]
-    InternalError(#[from] GenServerError),
+    InternalError(#[from] ActorError),
     #[error("Retrieval Error: {0}")]
     RetrievalError(String),
     #[error("Conversion Error: {0}")]
@@ -261,6 +292,18 @@ pub enum CommitterError {
     UnexpectedError(String),
     #[error("Unreachable code reached: {0}")]
     Unreachable(String),
+    #[error("Failed to generate batch witness: {0}")]
+    FailedToGenerateBatchWitness(#[source] ChainError),
+    #[error("Missing blob for batch {0}")]
+    MissingBlob(u64),
+    #[error("Failed to create checkpoint: {0}")]
+    FailedToCreateCheckpoint(String),
+    #[error("Failed to process blobs: {0}")]
+    ChainError(#[from] ChainError),
+    #[error("Failed due to invalid fork choice: {0}")]
+    InvalidForkChoice(#[from] InvalidForkChoice),
+    #[error("Privileged transaction hash could not be computed")]
+    InvalidPrivilegedTransaction,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -286,7 +329,7 @@ pub enum MetricsGathererError {
     #[error("MetricsGatherer: {0}")]
     TryInto(String),
     #[error("Internal Error: {0}")]
-    InternalError(#[from] GenServerError),
+    InternalError(#[from] ActorError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -300,65 +343,7 @@ pub enum ExecutionCacheError {
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionHandlerError {
     #[error("Internal Error: {0}")]
-    InternalError(#[from] GenServerError),
+    InternalError(#[from] ActorError),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum MonitorError {
-    #[error("Failed because of io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Failed to fetch {0:?} logs from {1}, {2}")]
-    LogsSignatures(Vec<String>, Address, #[source] EthClientError),
-    #[error("Failed to get batch by number {0}: {1}")]
-    GetBatchByNumber(u64, #[source] RollupStoreError),
-    #[error("Failed to get blocks by batch number {0}: {1}")]
-    GetBlocksByBatch(u64, #[source] RollupStoreError),
-    #[error("Batch {0} not found in the rollup store")]
-    BatchNotFound(u64),
-    #[error("Failed to get block by number {0}, {1}")]
-    GetBlockByNumber(u64, #[source] StoreError),
-    #[error("Block {0} not found in the store")]
-    BlockNotFound(u64),
-    #[error("Internal Error: {0}")]
-    InternalError(#[from] GenServerError),
-    #[error("Failed to get logs topics {0}")]
-    LogsTopics(usize),
-    #[error("Failed to get logs data from {0}")]
-    LogsData(usize),
-    #[error("Failed to get area chunks")]
-    Chunks,
-    #[error("Failed to get latest block")]
-    GetLatestBlock,
-    #[error("Failed to get latest batch")]
-    GetLatestBatch,
-    #[error("Failed to get latest verified batch")]
-    GetLatestVerifiedBatch,
-    #[error("Failed to get commited batch")]
-    GetLatestCommittedBatch,
-    #[error("Failed to get last L1 block fetched")]
-    GetLastFetchedL1,
-    #[error("Failed to get pending privileged transactions")]
-    GetPendingPrivilegedTx,
-    #[error("Failed to get transaction pool")]
-    TxPoolError,
-    #[error("Failed to encode calldata: {0}")]
-    CalldataEncodeError(#[from] CalldataEncodeError),
-    #[error("Failed to parse privileged transaction")]
-    PrivilegedTxParseError,
-    #[error("Failure in rpc call: {0}")]
-    EthClientError(#[from] EthClientError),
-    #[error("Failed to get receipt for transaction")]
-    ReceiptError,
-    #[error("Expected transaction to have logs")]
-    NoLogs,
-    #[error("Expected items in the table")]
-    NoItemsInTable,
-    #[error("RPC List can't be empty")]
-    RPCListEmpty,
-    #[error("Error converting batch window")]
-    BatchWindow,
-    #[error("Error while parsing private key")]
-    DecodingError(String),
-    #[error("Error parsing secret key")]
-    FromHexError(#[from] hex::FromHexError),
-}
+pub use ethrex_monitor::MonitorError;

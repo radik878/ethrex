@@ -6,49 +6,49 @@ use std::{
 
 use bytes::Bytes;
 use ethrex_blockchain::{
-    Blockchain,
+    Blockchain, BlockchainType,
     error::ChainError,
     fork_choice::apply_fork_choice,
     payload::{BuildPayloadArgs, create_payload},
-    validate_block,
+    validate_block_pre_execution,
 };
-use ethrex_common::Address;
 use ethrex_common::H256;
+use ethrex_common::{Address, U256};
+use ethrex_l2_sdk::calldata::encode_calldata;
+use ethrex_rpc::{
+    EthClient, SubscriptionManager, SubscriptionManagerProtocol,
+    clients::{EthClientError, Overrides},
+};
 use ethrex_storage::Store;
 use ethrex_storage_rollup::StoreRollup;
 use ethrex_vm::BlockExecutionResult;
 pub use payload_builder::build_payload;
+use reqwest::Url;
 use serde::Serialize;
-use spawned_concurrency::tasks::{
-    CallResponse, CastResponse, GenServer, GenServerHandle, send_after,
+use spawned_concurrency::{
+    actor,
+    error::ActorError,
+    protocol,
+    tasks::{Actor, ActorRef, ActorStart as _, Backend, Context, Handler, Response, send_after},
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    BlockProducerConfig, SequencerConfig,
-    based::sequencer_state::{SequencerState, SequencerStatus},
-};
+use crate::{BlockProducerConfig, SequencerConfig};
+use ethrex_l2_common::sequencer_state::{SequencerState, SequencerStatus};
+
+use std::str::FromStr;
 
 use super::errors::BlockProducerError;
 
 use ethrex_metrics::metrics;
 #[cfg(feature = "metrics")]
-use ethrex_metrics::{metrics_blocks::METRICS_BLOCKS, metrics_transactions::METRICS_TX};
+use ethrex_metrics::{blocks::METRICS_BLOCKS, transactions::METRICS_TX};
 
-#[derive(Clone)]
-pub enum CallMessage {
-    Health,
-}
-
-#[derive(Clone)]
-pub enum InMessage {
-    Produce,
-}
-
-#[derive(Clone)]
-pub enum OutMessage {
-    Done,
-    Health(BlockProducerHealth),
+#[protocol]
+pub trait BlockProducerProtocol: Send + Sync {
+    fn produce(&self) -> Result<(), ActorError>;
+    fn abort(&self) -> Result<(), ActorError>;
+    fn health(&self) -> Response<BlockProducerHealth>;
 }
 
 pub struct BlockProducer {
@@ -59,9 +59,13 @@ pub struct BlockProducer {
     coinbase_address: Address,
     elasticity_multiplier: u64,
     rollup_store: StoreRollup,
-    // Needed to ensure privileged tx nonces are sequential
-    last_privileged_nonce: Option<u64>,
+    // Needed to ensure privileged tx nonces are sequential per source chain
+    privileged_nonces: std::collections::HashMap<u64, Option<u64>>,
     block_gas_limit: u64,
+    eth_client: EthClient,
+    router_address: Address,
+    /// Actor handle for sending new block headers to WS subscribers.
+    subscription_manager: Option<ActorRef<SubscriptionManager>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -73,28 +77,43 @@ pub struct BlockProducerHealth {
 }
 
 impl BlockProducer {
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         config: &BlockProducerConfig,
+        l1_rpc_url: Vec<Url>,
         store: Store,
         rollup_store: StoreRollup,
         blockchain: Arc<Blockchain>,
         sequencer_state: SequencerState,
-    ) -> Self {
+        router_address: Address,
+        l2_gas_limit: u64,
+        subscription_manager: Option<ActorRef<SubscriptionManager>>,
+    ) -> Result<Self, EthClientError> {
         let BlockProducerConfig {
             block_time_ms,
             coinbase_address,
-            fee_vault_address,
+            base_fee_vault_address,
+            operator_fee_vault_address,
             elasticity_multiplier,
-            block_gas_limit,
         } = config;
 
-        if fee_vault_address.is_some_and(|fee_vault| fee_vault == *coinbase_address) {
+        let eth_client = EthClient::new_with_multiple_urls(l1_rpc_url)?;
+
+        if base_fee_vault_address.is_some_and(|base_fee_vault| base_fee_vault == *coinbase_address)
+        {
             warn!(
-                "The coinbase address and fee vault address are the same. Coinbase balance behavior will be affected.",
+                "The coinbase address and base fee vault address are the same. Coinbase balance behavior will be affected.",
+            );
+        }
+        if operator_fee_vault_address
+            .is_some_and(|operator_fee_vault| operator_fee_vault == *coinbase_address)
+        {
+            warn!(
+                "The coinbase address and operator fee vault address are the same. Coinbase balance behavior will be affected.",
             );
         }
 
-        Self {
+        Ok(Self {
             store,
             blockchain,
             sequencer_state,
@@ -103,31 +122,12 @@ impl BlockProducer {
             elasticity_multiplier: *elasticity_multiplier,
             rollup_store,
             // FIXME: Initialize properly to the last privileged nonce in the chain
-            last_privileged_nonce: None,
-            block_gas_limit: *block_gas_limit,
-        }
-    }
-
-    pub async fn spawn(
-        store: Store,
-        rollup_store: StoreRollup,
-        blockchain: Arc<Blockchain>,
-        cfg: SequencerConfig,
-        sequencer_state: SequencerState,
-    ) -> Result<GenServerHandle<BlockProducer>, BlockProducerError> {
-        let mut block_producer = Self::new(
-            &cfg.block_producer,
-            store,
-            rollup_store,
-            blockchain,
-            sequencer_state,
-        )
-        .start_blocking();
-        block_producer
-            .cast(InMessage::Produce)
-            .await
-            .map_err(BlockProducerError::InternalError)?;
-        Ok(block_producer)
+            privileged_nonces: std::collections::HashMap::new(),
+            block_gas_limit: l2_gas_limit,
+            eth_client,
+            router_address,
+            subscription_manager,
+        })
     }
 
     pub async fn produce_block(&mut self) -> Result<(), BlockProducerError> {
@@ -155,19 +155,23 @@ impl BlockProducer {
             random: H256::zero(),
             withdrawals: Default::default(),
             beacon_root: Some(head_beacon_block_root),
+            slot_number: None,
             version,
             elasticity_multiplier: self.elasticity_multiplier,
             gas_ceil: self.block_gas_limit,
         };
         let payload = create_payload(&args, &self.store, Bytes::new())?;
 
+        let registered_chains = self.get_registered_l2_chain_ids().await?;
+
         // Blockchain builds the payload from mempool txs and executes them
         let payload_build_result = build_payload(
             self.blockchain.clone(),
             payload,
             &self.store,
-            &mut self.last_privileged_nonce,
+            &mut self.privileged_nonces,
             self.block_gas_limit,
+            registered_chains,
         )
         .await?;
         info!(
@@ -177,8 +181,8 @@ impl BlockProducer {
 
         // Blockchain stores block
         let block = payload_build_result.payload;
-        let chain_config = self.store.get_chain_config()?;
-        validate_block(
+        let chain_config = self.store.get_chain_config();
+        validate_block_pre_execution(
             &block,
             &head_header,
             &chain_config,
@@ -190,35 +194,45 @@ impl BlockProducer {
         let execution_result = BlockExecutionResult {
             receipts: payload_build_result.receipts,
             requests: Vec::new(),
+            // Use the block header's gas_used which was set during payload building
+            block_gas_used: block.header.gas_used,
+            burned_fees: None,
+            tx_gas_breakdowns: Vec::new(),
         };
 
         let account_updates_list = self
             .store
-            .apply_account_updates_batch(block.header.parent_hash, &account_updates)
-            .await?
+            .apply_account_updates_batch(block.header.parent_hash, &account_updates)?
             .ok_or(ChainError::ParentStateNotFound)?;
 
         let transactions_count = block.body.transactions.len();
         let block_number = block.header.number;
         let block_hash = block.hash();
+        // Save the header for newHeads notifications before block is moved into store_block.
+        let block_header = block.header.clone();
+        self.store_fee_config_by_block(block.header.number).await?;
         self.blockchain
-            .store_block(block, account_updates_list, execution_result)
-            .await?;
-        info!("Stored new block {:x}", block_hash);
+            .store_block(block, account_updates_list, execution_result)?;
+        info!(
+            "Stored new block {:x}, transaction_count {}",
+            block_hash, transactions_count
+        );
+        // WARN: We're not storing the payload into the Store because there's no use to it by the L2 for now.
 
         self.rollup_store
             .store_account_updates_by_block_number(block_number, account_updates)
             .await?;
 
         // Make the new head be part of the canonical chain
-        apply_fork_choice(&self.store, block_hash, block_hash, block_hash).await?;
+        apply_fork_choice(&self.store, block_hash, block_hash, block_hash, None).await?;
+
+        // Notify all eth_subscribe("newHeads") subscribers.
+        if let Some(ref manager) = self.subscription_manager {
+            let _ = manager.new_head(block_header);
+        }
 
         metrics!(
-            let _ = METRICS_BLOCKS
-            .set_block_number(block_number)
-            .inspect_err(|e| {
-                tracing::error!("Failed to set metric: block_number {}", e.to_string())
-            });
+            METRICS_BLOCKS.set_block_number(block_number);
             #[allow(clippy::as_conversions)]
             let tps = transactions_count as f64 / (self.block_time_ms as f64 / 1000_f64);
             METRICS_TX.set_transactions_per_second(tps);
@@ -226,21 +240,111 @@ impl BlockProducer {
 
         Ok(())
     }
+    async fn store_fee_config_by_block(&self, block_number: u64) -> Result<(), BlockProducerError> {
+        let BlockchainType::L2(l2_config) = &self.blockchain.options.r#type else {
+            error!("Invalid blockchain type. Expected L2.");
+            return Err(BlockProducerError::Custom("Invalid blockchain type".into()));
+        };
+
+        let fee_config = *l2_config
+            .fee_config
+            .read()
+            .map_err(|_| BlockProducerError::Custom("Fee config lock was poisoned".to_string()))?;
+
+        self.rollup_store
+            .store_fee_config_by_block(block_number, fee_config)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_registered_l2_chain_ids(&self) -> Result<Vec<U256>, BlockProducerError> {
+        if self.router_address == Address::zero() {
+            info!("Router address is zero, no registered L2 chain IDs.");
+            return Ok(Vec::new());
+        }
+        let calldata = encode_calldata("getRegisteredChainIds()", &[])?;
+
+        let registered_chains = self
+            .eth_client
+            .call(self.router_address, calldata.into(), Overrides::default())
+            .await?;
+        let registered_chains = registered_chains.trim_start_matches("0x");
+        let length = usize::from_str_radix(
+            registered_chains
+                .get(64..128)
+                .ok_or(BlockProducerError::Custom(
+                    "Failed to get length for registered chains".into(),
+                ))?,
+            16,
+        )
+        .map_err(|_| {
+            BlockProducerError::Custom("Failed to parse length for registered chains".into())
+        })?;
+
+        let mut chain_ids = Vec::new();
+
+        let mut index = 128;
+        for _ in 0..length {
+            let elem_hex =
+                registered_chains
+                    .get(index..index + 64)
+                    .ok_or(BlockProducerError::Custom(
+                        "Failed to get chain id hex".into(),
+                    ))?;
+            let chain_id = U256::from_str(elem_hex).map_err(|_| {
+                BlockProducerError::Custom("Failed to get chain for registered chains".into())
+            })?;
+            chain_ids.push(chain_id);
+            index += 64;
+        }
+
+        info!("Registered chains: {:?}", chain_ids);
+        Ok(chain_ids)
+    }
 }
 
-impl GenServer for BlockProducer {
-    type CallMsg = CallMessage;
-    type CastMsg = InMessage;
-    type OutMsg = OutMessage;
-    type Error = BlockProducerError;
+#[actor(protocol = BlockProducerProtocol)]
+impl BlockProducer {
+    #[expect(clippy::too_many_arguments)]
+    pub async fn spawn(
+        store: Store,
+        rollup_store: StoreRollup,
+        blockchain: Arc<Blockchain>,
+        cfg: SequencerConfig,
+        sequencer_state: SequencerState,
+        router_address: Address,
+        l2_gas_limit: u64,
+        subscription_manager: Option<ActorRef<SubscriptionManager>>,
+    ) -> Result<ActorRef<BlockProducer>, BlockProducerError> {
+        let block_producer = Self::new(
+            &cfg.block_producer,
+            cfg.eth.rpc_url,
+            store,
+            rollup_store,
+            blockchain,
+            sequencer_state,
+            router_address,
+            l2_gas_limit,
+            subscription_manager,
+        )?;
+        let actor_ref = block_producer.start_with_backend(Backend::Blocking);
+        Ok(actor_ref)
+    }
 
-    async fn handle_cast(
+    #[started]
+    async fn started(&mut self, ctx: &Context<Self>) {
+        let _ = ctx
+            .send(block_producer_protocol::Produce)
+            .inspect_err(|e| error!("Failed to send initial Produce: {e}"));
+    }
+
+    #[send_handler]
+    async fn handle_produce(
         &mut self,
-        _message: Self::CastMsg,
-        handle: &GenServerHandle<Self>,
-    ) -> CastResponse {
-        // Right now we only have the Produce message, so we ignore the message
-        if let SequencerStatus::Sequencing = self.sequencer_state.status().await {
+        _msg: block_producer_protocol::Produce,
+        ctx: &Context<Self>,
+    ) {
+        if let SequencerStatus::Sequencing = self.sequencer_state.status() {
             let _ = self
                 .produce_block()
                 .await
@@ -248,24 +352,27 @@ impl GenServer for BlockProducer {
         }
         send_after(
             Duration::from_millis(self.block_time_ms),
-            handle.clone(),
-            Self::CastMsg::Produce,
+            ctx.clone(),
+            block_producer_protocol::Produce,
         );
-        CastResponse::NoReply
     }
 
-    async fn handle_call(
+    #[send_handler]
+    async fn handle_abort(&mut self, _msg: block_producer_protocol::Abort, ctx: &Context<Self>) {
+        ctx.stop();
+    }
+
+    #[request_handler]
+    async fn handle_health(
         &mut self,
-        message: Self::CallMsg,
-        _handle: &GenServerHandle<Self>,
-    ) -> CallResponse<Self> {
-        match message {
-            CallMessage::Health => CallResponse::Reply(OutMessage::Health(BlockProducerHealth {
-                sequencer_state: format!("{:?}", self.sequencer_state.status().await),
-                block_time_ms: self.block_time_ms,
-                coinbase_address: self.coinbase_address,
-                elasticity_multiplier: self.elasticity_multiplier,
-            })),
+        _msg: block_producer_protocol::Health,
+        _ctx: &Context<Self>,
+    ) -> BlockProducerHealth {
+        BlockProducerHealth {
+            sequencer_state: format!("{:?}", self.sequencer_state.status()),
+            block_time_ms: self.block_time_ms,
+            coinbase_address: self.coinbase_address,
+            elasticity_multiplier: self.elasticity_multiplier,
         }
     }
 }

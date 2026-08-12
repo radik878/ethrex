@@ -24,16 +24,20 @@ impl RpcHandler for ChainId {
 
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
         debug!("Requested chain id");
-        let chain_spec = context
-            .storage
-            .get_chain_config()
-            .map_err(|error| RpcErr::Internal(error.to_string()))?;
+        let chain_spec = context.storage.get_chain_config();
         serde_json::to_value(format!("{:#x}", chain_spec.chain_id))
             .map_err(|error| RpcErr::Internal(error.to_string()))
     }
 }
 
 pub struct Syncing;
+
+/// How many blocks the executed head may trail the forkchoice target while still
+/// being reported as synced. A node following head sits within a block or two of the
+/// forkchoice head, so this absorbs normal per-slot lag and brief batch imports
+/// without flapping, while a genuine fall-behind (hundreds of blocks) is reported as
+/// syncing even though the `is_synced()` latch is still set.
+const SYNCED_HEAD_TOLERANCE: u64 = 8;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,21 +57,65 @@ impl RpcHandler for Syncing {
     }
 
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
-        if context.blockchain.is_synced() {
-            Ok(Value::Bool(!context.blockchain.is_synced()))
-        } else {
-            let syncing_status = SyncingStatusRpc {
-                starting_block: context.storage.get_earliest_block_number().await?,
-                current_block: context.storage.get_latest_block_number().await?,
-                highest_block: context
-                    .syncer
-                    .get_last_fcu_head()
-                    .map_err(|error| RpcErr::Internal(error.to_string()))?
-                    .to_low_u64_be(),
-            };
-            serde_json::to_value(syncing_status)
-                .map_err(|error| RpcErr::Internal(error.to_string()))
+        let Some(syncer) = &context.syncer else {
+            return Err(RpcErr::Internal(
+                "Syncing status requested but syncer is not initialized".to_string(),
+            ));
+        };
+
+        // `current_block` must reflect the executed/state head, not the canonical
+        // pointer. An FCU can canonicalize blocks before their state is computed
+        // (full-sync wedge), and snap may not have healed up to the head, so the
+        // canonical head can be stateless. Reporting it would make the node look
+        // near-synced while it has no state up to the tip. Use the canonical head
+        // only when its post-state is on disk; otherwise report the executed head
+        // recorded by the sync cycle.
+        let canonical_head = context.storage.get_latest_block_number().await?;
+        let current_block = match context.storage.get_block_header(canonical_head)? {
+            Some(header) if context.storage.has_state_root(header.state_root)? => canonical_head,
+            _ => syncer
+                .diagnostics()
+                .read()
+                .await
+                .executed_head
+                .min(canonical_head),
+        };
+
+        // `get_last_fcu_head` returns the head *hash* from the last forkchoiceUpdated.
+        // Resolve it to a block number (the consensus-provided sync target). If the
+        // header isn't canonical yet it may still be a pending block whose number we
+        // can read; only when neither is available (e.g. mid snap-sync, target not
+        // downloaded) fall back to the canonical head instead of reporting garbage.
+        let head_hash = syncer
+            .get_last_fcu_head()
+            .map_err(|error| RpcErr::Internal(error.to_string()))?;
+        let highest_block = match context.storage.get_block_number(head_hash).await? {
+            Some(number) => number,
+            None => match context.storage.get_pending_block(head_hash).await? {
+                Some(block) => block.header.number,
+                None => canonical_head,
+            },
+        };
+
+        // `is_synced()` is a latch: it flips true on the first successful FCU and is
+        // never reset on L1 (`set_not_synced` has no L1 caller), so it does not reflect
+        // a node that synced once and later fell behind its consensus client. Trusting
+        // it alone makes `eth_syncing` report `false` for a wedged/lagging node. Treat
+        // the node as synced only if the latch is set AND the executed head has reached
+        // (within a small following tolerance) the forkchoice target.
+        let synced = context.blockchain.is_synced()
+            && current_block + SYNCED_HEAD_TOLERANCE >= highest_block;
+
+        if synced {
+            return Ok(Value::Bool(false));
         }
+
+        let syncing_status = SyncingStatusRpc {
+            starting_block: context.storage.get_earliest_block_number().await?,
+            current_block,
+            highest_block,
+        };
+        serde_json::to_value(syncing_status).map_err(|error| RpcErr::Internal(error.to_string()))
     }
 }
 
@@ -87,7 +135,7 @@ struct EthConfigObject {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EthConfigResponse {
+pub struct EthConfigResponse {
     current: EthConfigObject,
     next: Option<EthConfigObject>,
     last: Option<EthConfigObject>,
@@ -99,7 +147,7 @@ impl RpcHandler for Config {
     }
 
     async fn handle(&self, context: RpcApiContext) -> Result<Value, RpcErr> {
-        let chain_config = context.storage.get_chain_config()?;
+        let chain_config = context.storage.get_chain_config();
         let Some(latest_block) = context
             .storage
             .get_block_by_number(context.storage.get_latest_block_number().await?)
@@ -112,7 +160,7 @@ impl RpcHandler for Config {
         let current_fork = chain_config.get_fork(latest_block_timestamp);
 
         if current_fork < Fork::Paris {
-            return Err(RpcErr::UnsuportedFork(
+            return Err(RpcErr::UnsupportedFork(
                 "eth-config is not supported for forks prior to Paris".to_string(),
             ));
         }
@@ -143,7 +191,7 @@ async fn get_config_for_fork(
     fork: Fork,
     context: &RpcApiContext,
 ) -> Result<EthConfigObject, RpcErr> {
-    let chain_config = context.storage.get_chain_config()?;
+    let chain_config = context.storage.get_chain_config();
     let activation_time = chain_config.get_activation_timestamp_for_fork(fork);
     let genesis_header = context
         .storage

@@ -14,7 +14,12 @@ use ethrex_rlp::{
 use secp256k1::PublicKey;
 use serde::Serialize;
 
-pub const SUPPORTED_ETH_CAPABILITIES: [Capability; 2] = [Capability::eth(68), Capability::eth(69)];
+pub const SUPPORTED_ETH_CAPABILITIES: [Capability; 4] = [
+    Capability::eth(68),
+    Capability::eth(69),
+    Capability::eth(70),
+    Capability::eth(71),
+];
 pub const SUPPORTED_SNAP_CAPABILITIES: [Capability; 1] = [Capability::snap(1)];
 
 /// The version of the base P2P protocol we support.
@@ -192,6 +197,30 @@ pub enum DisconnectReason {
     InvalidReason = 0xff,
 }
 
+impl DisconnectReason {
+    // Returns a vector of all DisconnectReason variants, we need to update this method when we add,
+    // change or remove any DisconnectReason variants which are used in metrics.
+    // A test ensures this method is up to date.
+    pub fn all() -> Vec<DisconnectReason> {
+        vec![
+            DisconnectReason::DisconnectRequested,
+            DisconnectReason::NetworkError,
+            DisconnectReason::ProtocolError,
+            DisconnectReason::UselessPeer,
+            DisconnectReason::TooManyPeers,
+            DisconnectReason::AlreadyConnected,
+            DisconnectReason::IncompatibleVersion,
+            DisconnectReason::InvalidIdentity,
+            DisconnectReason::ClientQuitting,
+            DisconnectReason::UnexpectedIdentity,
+            DisconnectReason::SelfIdentity,
+            DisconnectReason::PingTimeout,
+            DisconnectReason::SubprotocolError,
+            DisconnectReason::InvalidReason,
+        ]
+    }
+}
+
 // impl display for disconnectreason
 impl std::fmt::Display for DisconnectReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -355,35 +384,5 @@ impl RLPxMessage for PongMessage {
         assert_eq!(payload, empty, "Pong payload should be &[]");
         assert_eq!(remaining, empty, "Pong remaining should be &[]");
         Ok(Self {})
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use ethrex_rlp::{decode::RLPDecode, encode::RLPEncode};
-
-    use crate::rlpx::p2p::Capability;
-
-    #[test]
-    fn test_encode_capability() {
-        let capability = Capability::eth(8);
-        let encoded = capability.encode_to_vec();
-
-        assert_eq!(&encoded, &[197_u8, 131, b'e', b't', b'h', 8]);
-    }
-
-    #[test]
-    fn test_decode_capability() {
-        let encoded_bytes = &[197_u8, 131, b'e', b't', b'h', 8];
-        let decoded = Capability::decode(encoded_bytes).unwrap();
-
-        assert_eq!(decoded, Capability::eth(8));
-    }
-
-    #[test]
-    fn test_protocol() {
-        let capability = Capability::eth(68);
-
-        assert_eq!(capability.protocol(), "eth");
     }
 }
